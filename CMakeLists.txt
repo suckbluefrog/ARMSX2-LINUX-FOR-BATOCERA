@@ -81,13 +81,11 @@ No support will be provided, continue at your own risk.
 *********************************************************")
 endif()
 
-if(ARCH_ARM64)
+if(ARCH_ARM64 AND APPLE)
 	message(WARNING "
-*************** UNSUPPORTED CONFIGURATION ***************
-Apple Silicon support in PCSX2 is INCOMPLETE. There are
-currently no EE/VU/IOP recompilers, and games will run
-VERY slow. There is no date for completion yet, you
-should set -DCMAKE_OSX_ARCHITECTURES=x86_64 for now,
-unless you want to work on the recompilers.
+*************** EXPERIMENTAL CONFIGURATION ***************
+Apple Silicon support in PCSX2 is still being validated.
+On Linux ARM64 the native JIT backend is enabled by default.
+For macOS x86_64 builds, set -DCMAKE_OSX_ARCHITECTURES=x86_64.
 *********************************************************")
 endif()

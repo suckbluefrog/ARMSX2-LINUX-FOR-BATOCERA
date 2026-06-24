@@ -111,7 +111,13 @@ void StackModel::refreshData()
 	{
 		if (thread->Status() == ThreadStatus::THS_RUN)
 		{
-			m_stackFrames = m_cpu.StackTrace(*thread);
+			m_stackFrames = MipsStackWalk::Walk(
+				&m_cpu,
+				m_cpu.getPC(),
+				static_cast<u32>(m_cpu.getRegister(0, 31)),
+				static_cast<u32>(m_cpu.getRegister(0, 29)),
+				thread->EntryPoint(),
+				thread->StackTop());
 			break;
 		}
 	}

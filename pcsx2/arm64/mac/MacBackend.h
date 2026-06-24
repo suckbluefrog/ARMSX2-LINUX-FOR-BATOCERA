@@ -13,8 +13,7 @@
 // VUmicro.h's recMicroVU0/recMicroVU1 which are final). The renamed classes
 // are declared inside pcsx2_macrec — see arm64/mac/aVU.h.
 //
-// VMManager picks which backend's vtable to install per CPU at runtime based
-// on EmuConfig.Cpu.Recompiler.UseMac{EE,IOP,VU0,VU1}.
+// Android refresh installs this backend for all enabled ARM64 recompilers.
 
 #include "R5900.h"
 #include "R3000A.h"

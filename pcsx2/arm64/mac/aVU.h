@@ -300,7 +300,8 @@ struct microProgManager
 	u32                curFrame;           // Frame Counter
 	u8*                codePtr;            // Pointer to program's recompilation code  (x86: x86ptr)
 	u8*                codeStart;          // Start of program's rec-cache             (x86: x86start)
-	u8*                codeEnd;            // Limit of program's rec-cache             (x86: x86end)
+	u8*                codeEnd;            // Reset threshold, kept short of the physical end so one compile can spill safely.
+	u8*                codeReserveEnd;     // Physical end of the rec-cache reserve; hard capacity handed to VIXL.
 	microRegInfo       lpState;            // Pipeline state from where program left off (useful for continuing execution)
 };
 
@@ -517,8 +518,8 @@ extern microVU microVU1;
 
 // macOS-port VU recompiler instances. These mirror VUmicro.h's
 // recMicroVU0/recMicroVU1 (both final), but live in pcsx2_macrec so they don't
-// collide with the original Android recArmVU0/1 backend. VMManager picks per-CPU
-// at runtime via EmuConfig.Cpu.Recompiler.UseMacVU0/UseMacVU1.
+// collide with the original Android recArmVU0/1 backend. Android refresh now
+// installs these for enabled VU0/VU1 recompilers.
 class recMacMVU0 final : public BaseVUmicroCPU
 {
 public:

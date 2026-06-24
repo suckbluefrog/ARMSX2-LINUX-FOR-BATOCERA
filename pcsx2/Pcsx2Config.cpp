@@ -459,12 +459,18 @@ Pcsx2Config::RecompilerOptions::RecompilerOptions()
 	EnableFastmem = true;
 	PauseOnTLBMiss = false;
 
-	// Default backends: original arm64 for EE/IOP/VU0, macOS-port for VU1.
-	// Flip individual CPUs to bisect regressions (see Config.h).
+#if defined(__aarch64__) || defined(_M_ARM64)
+	// Linux/Android ARM64: macOS-port backend (pcsx2_macrec) is the single rec path.
+	UseMacEE = true;
+	UseMacIOP = true;
+	UseMacVU0 = true;
+	UseMacVU1 = true;
+#else
 	UseMacEE = false;
 	UseMacIOP = false;
 	UseMacVU0 = false;
 	UseMacVU1 = true;
+#endif
 
 	// Phase 2 microVU inline FMAC stall — OFF by default until verified.
 	Vu1InlineFmacStall = false;
@@ -493,6 +499,14 @@ Pcsx2Config::RecompilerOptions::RecompilerOptions()
 
 void Pcsx2Config::RecompilerOptions::ApplySanityCheck()
 {
+#if defined(__aarch64__) || defined(_M_ARM64)
+	// Do not let old INI/per-game configs revive the mixed original/mac ARM64 backend.
+	UseMacEE = true;
+	UseMacIOP = true;
+	UseMacVU0 = true;
+	UseMacVU1 = true;
+#endif
+
 	bool fpuIsRight = true;
 
 	if (fpuExtraOverflow)

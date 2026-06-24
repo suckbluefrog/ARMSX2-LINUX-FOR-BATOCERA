@@ -25,6 +25,30 @@ void vs_main()
 
 #ifdef FRAGMENT_SHADER
 
+// Adreno's GLSL ES preprocessor errors on undefined identifiers in #if
+// expressions (desktop treats them as 0). The PrimID DATE-init programs are
+// compiled WITHOUT the per-ShaderConvert macro block (see GSDeviceOGL's
+// ps_primid_image_init loop), so every macro in the OUTPUT chain below needs
+// an explicit default.
+#ifndef HAS_INTEGER_OUTPUT
+#define HAS_INTEGER_OUTPUT 0
+#endif
+#ifndef HAS_DEPTH_OUTPUT
+#define HAS_DEPTH_OUTPUT 0
+#endif
+#ifndef HAS_FLOAT32_OUTPUT
+#define HAS_FLOAT32_OUTPUT 0
+#endif
+#ifndef HAS_STENCIL_OUTPUT
+#define HAS_STENCIL_OUTPUT 0
+#endif
+#ifndef HAS_FLOAT32_INPUT
+#define HAS_FLOAT32_INPUT 0
+#endif
+#ifndef HAS_BILN
+#define HAS_BILN 0
+#endif
+
 in vec4 PSin_p;
 in vec2 PSin_t;
 in vec4 PSin_c;
@@ -35,7 +59,11 @@ layout(binding = 0) uniform sampler2D TextureSampler;
 	layout(location = 0) out uint o_col0;
 	#define OUTPUT o_col0
 #elif HAS_DEPTH_OUTPUT
+	// gl_FragDepth must not be redeclared on GLES ("reserved built-in name"
+	// compile error on Adreno/Mali) — it's available as a built-in there.
+	#ifndef GL_ES
 	out float gl_FragDepth;
+	#endif
 	#define OUTPUT gl_FragDepth
 #elif HAS_FLOAT32_OUTPUT
 	layout(location = 0) out float o_col0;
@@ -161,12 +189,12 @@ uniform float StepMultiplier;
 
 void ps_downsample_copy()
 {
-	ivec2 coord = max(ivec2(gl_FragCoord.xy) * DownsampleFactor, ClampMin);
+	ivec2 coord = max(GS_FRAGCOORD_ICOORD * DownsampleFactor, ClampMin);
 	vec4 result = vec4(0);
 	for (int yoff = 0; yoff < DownsampleFactor; yoff++)
 	{
 		for (int xoff = 0; xoff < DownsampleFactor; xoff++)
-			result += texelFetch(TextureSampler, coord + ivec2(xoff * StepMultiplier, yoff * StepMultiplier), 0);
+			result += texelFetch(TextureSampler, coord + ivec2(float(xoff) * StepMultiplier, float(yoff) * StepMultiplier), 0);
 	}
 	o_col0 = result / Weight;
 }

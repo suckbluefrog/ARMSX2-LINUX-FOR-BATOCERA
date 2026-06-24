@@ -10,6 +10,11 @@ fi
 # The bundled ffmpeg has a lot of things disabled to reduce code size.
 # Users may want to use system ffmpeg for additional features
 : ${BUILD_FFMPEG:=0}
+# Qt APNG plugin (animated PNG covers). Optional — skip to save build time.
+: ${BUILD_QTAPNG:=0}
+# Legacy upstream patches; newer tarballs often build without them.
+: ${APPLY_QTAPNG_PATCH:=0}
+: ${APPLY_SHADERC_PATCH:=0}
 
 SCRIPTDIR=$(realpath $(dirname "${BASH_SOURCE[0]}"))
 NPROCS="$(getconf _NPROCESSORS_ONLN)"
@@ -281,14 +286,20 @@ ninja install
 cd ../../
 
 echo "Building Qt APNG..."
+if [ "$BUILD_QTAPNG" -eq 1 ]; then
 rm -fr "QtApng-$QTAPNG"
 tar xf "QtApng-$QTAPNG.tar.gz"
 cd "QtApng-$QTAPNG"
-patch -p1 < "$SCRIPTDIR/../common/qtapng-cmake.patch"
+if [ "$APPLY_QTAPNG_PATCH" -eq 1 ]; then
+	patch -p1 < "$SCRIPTDIR/../common/qtapng-cmake.patch"
+fi
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$INSTALLDIR" -DCMAKE_INSTALL_PREFIX="$INSTALLDIR" -B build -G Ninja
 cmake --build build --parallel
 ninja -C build install
 cd ..
+else
+	echo "Skipping Qt APNG (BUILD_QTAPNG=0)."
+fi
 
 echo "Building KDDockWidgets..."
 rm -fr "KDDockWidgets-$KDDOCKWIDGETS"
@@ -338,7 +349,9 @@ mv "SPIRV-Headers-$SHADERC_SPIRVHEADERS" "spirv-headers"
 tar xf "../../shaderc-spirv-tools-$SHADERC_SPIRVTOOLS.tar.gz"
 mv "SPIRV-Tools-$SHADERC_SPIRVTOOLS" "spirv-tools"
 cd ..
-patch -p1 < "$SCRIPTDIR/../common/shaderc-changes.patch"
+if [ "$APPLY_SHADERC_PATCH" -eq 1 ]; then
+	patch -p1 < "$SCRIPTDIR/../common/shaderc-changes.patch"
+fi
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$INSTALLDIR" -DCMAKE_INSTALL_PREFIX="$INSTALLDIR" -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON -B build -G Ninja
 cmake --build build --parallel
 ninja -C build install

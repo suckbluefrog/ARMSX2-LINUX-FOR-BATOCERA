@@ -18,6 +18,15 @@ layout(std140, binding = 1) uniform cb20
 
 #ifdef VERTEX_SHADER
 
+#ifndef VS_EXPAND_NONE
+#define VS_EXPAND_NONE 0
+#define VS_EXPAND_POINT 1
+#define VS_EXPAND_LINE 2
+#define VS_EXPAND_SPRITE 3
+#define VS_EXPAND_LINE_AA1 4
+#define VS_EXPAND_TRIANGLE_AA1 5
+#endif
+
 out SHADER
 {
 	vec4 t_float;
@@ -27,11 +36,13 @@ out SHADER
 	#else
 		flat vec4 c;
 	#endif
+	float inv_cov; // We use the inverse to make it simpler to interpolate.
+	flat uint interior; // 1 for triangle interior; 0 for edge.
 } VSout;
 
 const float exp_min32 = exp2(-32.0f);
 
-#if VS_EXPAND == 0
+#if VS_EXPAND == VS_EXPAND_NONE
 
 layout(location = 0) in vec2  i_st;
 layout(location = 2) in vec4  i_c;
@@ -76,7 +87,8 @@ void vs_main()
 	#if HAS_CLIP_CONTROL
 		gl_Position.z = float(z) * exp_min32;
 	#else
-		gl_Position.z = (float(z) * exp_min32) * 2.0f - 1.0f;
+		// GLES doesn't support ARB_clip_control, so remap [0,1] to [-1,1].
+		gl_Position.z = min(float(z) * exp2(-23.0f), 2.0f) - 1.0f;
 	#endif
 
 	gl_Position.w = 1.0f;
@@ -104,8 +116,21 @@ struct RawVertex
 	uint FOG;
 };
 
+layout(std140, binding = 4) uniform cb22
+{
+	uint BaseVertex;
+	uint BaseIndex;
+	uint pad_cb22_0;
+	uint pad_cb22_1;
+};
+
 layout(std140, binding = 2) readonly buffer VertexBuffer {
 	RawVertex vertex_buffer[];
+};
+
+// Warning: use std430 instead of std140 so that the ints are tightly packed.
+layout(std430, binding = 3) readonly buffer IndexBuffer {
+	uint index_buffer[];
 };
 
 struct ProcessedVertex
@@ -116,9 +141,17 @@ struct ProcessedVertex
 	vec4 c;
 };
 
+uint load_index(uint _i)
+{
+	uint i = _i + BaseIndex;
+	// i is even => load lower 16 bits; i odd => load upper 16 bits.
+	uint shift = (i & 1u) << 4u;
+	return (index_buffer[i >> 1u] >> shift) & 0xFFFFu;
+}
+
 ProcessedVertex load_vertex(uint index)
 {
-	RawVertex rvtx = vertex_buffer[index];
+	RawVertex rvtx = vertex_buffer[BaseVertex + index];
 
 	vec2 i_st = rvtx.ST;
 	vec4 i_c = vec4(uvec4(bitfieldExtract(rvtx.RGBA, 0, 8), bitfieldExtract(rvtx.RGBA, 8, 8),
@@ -138,7 +171,8 @@ ProcessedVertex load_vertex(uint index)
 	#if HAS_CLIP_CONTROL
 		vtx.p.z = float(z) * exp_min32;
 	#else
-		vtx.p.z = (float(z) * exp_min32) * 2.0f - 1.0f;
+		// GLES doesn't support ARB_clip_control, so remap [0,1] to [-1,1].
+		vtx.p.z = min(float(z) * exp2(-23.0f), 2.0f) - 1.0f;
 	#endif
 
 	vtx.p.w = 1.0f;
@@ -272,14 +306,14 @@ void main()
 
 	uint vid = uint(gl_VertexID);
 
-#if VS_EXPAND == 1 // Point
+#if VS_EXPAND == VS_EXPAND_POINT
 
 	vtx = load_vertex(vid >> 2);
 
 	vtx.p.x += ((vid & 1u) != 0u) ? PointSize.x : 0.0f;
 	vtx.p.y += ((vid & 2u) != 0u) ? PointSize.y : 0.0f;
 
-#elif VS_EXPAND == 2 // Line
+#elif (VS_EXPAND == VS_EXPAND_LINE) || (VS_EXPAND == VS_EXPAND_LINE_AA1)
 
 	uint vid_base = vid >> 2;
 	bool is_bottom = (vid & 2u) != 0u;
@@ -301,11 +335,15 @@ void main()
 	vec2 offset = is_right ? line_width : -line_width;
 	vtx.p.xy += offset;
 
+#if VS_EXPAND == VS_EXPAND_LINE_AA1
+	VSout.inv_cov = is_right ? 1.0f : -1.0f;
+#endif
+
 	// Lines will be run as (0 1 2) (1 2 3)
 	// This means that both triangles will have a point based off the top line point as their first point
 	// So we don't have to do anything for !IIP
 
-#elif VS_EXPAND == 3 // Sprite
+#elif VS_EXPAND == VS_EXPAND_SPRITE
 
 	// Sprite points are always in pairs
 	uint vid_base = vid >> 1;

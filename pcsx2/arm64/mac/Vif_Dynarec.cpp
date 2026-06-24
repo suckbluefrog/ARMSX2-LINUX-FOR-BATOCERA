@@ -4,6 +4,7 @@
 
 #include "arm64/mac/Vif_UnpackNEON.h"
 #include "arm64/mac/AsmHelpers.h"
+#include "AndroidPerfBuckets.h"
 #include "MTVU.h"
 
 #include "common/Assertions.h"
@@ -582,6 +583,12 @@ _vifT __fi void dVifUnpack(const u8* data, bool isFill)
 		{
 			VIF_LOG("Running Interpreter Block: nVif%x - VU Mem Ptr Overflow; falling back to interpreter. Start = %x End = %x num = %x, wl = %x, cl = %x",
 				v.idx, vif.tag.addr, vif.tag.addr + (block.num * 16), block.num, block.wl, block.cl);
+#if defined(__ANDROID__)
+			AndroidPerfBuckets::ScopedTimer timer(
+				AndroidPerfBuckets::s_vif_dyn_overflow_fallback_count,
+				AndroidPerfBuckets::s_vif_dyn_overflow_fallback_us,
+				"vif_dyn_overflow_fb");
+#endif
 			_nVifUnpack(idx, data, vifRegs.mode, isFill);
 		}
 	}

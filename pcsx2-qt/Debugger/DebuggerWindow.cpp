@@ -525,7 +525,8 @@ void DebuggerWindow::onStepOut()
 				cpu->getPC(),
 				cpu->getRegister(0, 31),
 				cpu->getRegister(0, 29),
-				thread->EntryPoint());
+				thread->EntryPoint(),
+				thread->StackTop());
 			break;
 		}
 	}

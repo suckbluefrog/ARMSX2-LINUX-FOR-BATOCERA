@@ -2710,7 +2710,7 @@ void VMManager::InitializeCPUProviders()
 #ifndef INTERP_VU1
 	CpuArmVU1.Reserve();
 #endif
-	// Reserve the macOS-port backends too; UpdateCPUImplementations picks per-CPU.
+	// Reserve the macOS/PCSX2 ARM64 backend used by UpdateCPUImplementations.
 	pcsx2_macrec::recCpu.Reserve();
 	pcsx2_macrec::psxRec.Reserve();
 	pcsx2_macrec::CpuMicroVU0.Reserve();

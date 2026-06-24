@@ -302,6 +302,15 @@ GSRendererType GSUtil::GetPreferredRenderer()
 #else
 		preferred_renderer = GSRendererType::SW;
 #endif
+#elif defined(__linux__) && defined(ARCH_ARM64)
+		// Linux ARM64 handhelds: prefer OpenGL HW (GLES) over Vulkan, same rationale as Android.
+#if defined(ENABLE_OPENGL)
+		preferred_renderer = GSRendererType::OGL;
+#elif defined(ENABLE_VULKAN)
+		preferred_renderer = GSRendererType::VK;
+#else
+		preferred_renderer = GSRendererType::SW;
+#endif
 #else
 		// Linux: Prefer Vulkan if the driver isn't buggy.
 #if defined(ENABLE_VULKAN)

@@ -592,8 +592,11 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	if (!CompileShadeBoostProgram() || !CompileFXAAProgram())
 		return false;
 
-	// Image load store and GLSL 420pack is core in GL4.2, no need to check.
-	m_features.cas_sharpening = ((GLAD_GL_VERSION_4_2 && GLAD_GL_ARB_compute_shader) || GLAD_GL_ES_VERSION_3_2) && CreateCASPrograms();
+	// CAS uses a desktop-GL compute shader (cas.glsl is "#version 420" +
+	// "#extension GL_ARB_compute_shader") — invalid GLSL ES. On handheld SoCs that
+	// only expose GLES (Adreno/Mali), feeding that source crashes the driver during
+	// GS init. Gate CAS to a real desktop-GL 4.2 context only.
+	m_features.cas_sharpening = (GLAD_GL_VERSION_4_2 && GLAD_GL_ARB_compute_shader) && CreateCASPrograms();
 
 	// ****************************************************************
 	// rasterization configuration
@@ -832,16 +835,17 @@ bool GSDeviceOGL::CheckFeatures()
 			return false;
 		}
 
-	if (!GLAD_GL_VERSION_4_3 && !GLAD_GL_ARB_copy_image && !GLAD_GL_EXT_copy_image && !GLAD_GL_NV_copy_image)
-	{
-		Host::AddOSDMessage(
-			"GL_ARB_copy_image is not supported, copies will be slower.", Host::OSD_ERROR_DURATION);
-	}
+		if (!GLAD_GL_VERSION_4_3 && !GLAD_GL_ARB_copy_image && !GLAD_GL_EXT_copy_image && !GLAD_GL_NV_copy_image)
+		{
+			Host::AddOSDMessage(
+				"GL_ARB_copy_image is not supported, copies will be slower.", Host::OSD_ERROR_DURATION);
+		}
 
-	if (!GLAD_GL_VERSION_4_5 && !GLAD_GL_ARB_clip_control)
-	{
-		Host::AddOSDMessage(
-			"GL_ARB_clip_control is not supported, depth will be less accurate.", Host::OSD_ERROR_DURATION);
+		if (!GLAD_GL_VERSION_4_5 && !GLAD_GL_ARB_clip_control)
+		{
+			Host::AddOSDMessage(
+				"GL_ARB_clip_control is not supported, depth will be less accurate.", Host::OSD_ERROR_DURATION);
+		}
 	}
 
 
@@ -1648,11 +1652,57 @@ std::string GSDeviceOGL::GenGlslHeader(const std::string_view entry, GLenum type
             header = "#version 320 es\n";
         else if (GLAD_GL_ES_VERSION_3_1)
             header = "#version 310 es\n";
+        else
+            header = "#version 300 es\n";
 
-	if (m_features.vs_expand && GLAD_GL_VERSION_4_3)
-	{
+        if (GLAD_GL_EXT_blend_func_extended)
+            header += "#extension GL_EXT_blend_func_extended : require\n";
+        if (GLAD_GL_ARB_blend_func_extended)
+            header += "#extension GL_ARB_blend_func_extended : require\n";
+
+        if (m_features.framebuffer_fetch)
+        {
+            if (GLAD_GL_ARM_shader_framebuffer_fetch)
+                header += "#extension GL_ARM_shader_framebuffer_fetch : require\n";
+            else if (GLAD_GL_EXT_shader_framebuffer_fetch)
+                header += "#extension GL_EXT_shader_framebuffer_fetch : require\n";
+        }
+
+        header += "precision highp float;\n";
+        header += "precision highp int;\n";
+        header += "precision highp sampler2D;\n";
+        if (GLAD_GL_ES_VERSION_3_1)
+            header += "precision highp sampler2DMS;\n";
+        if (GLAD_GL_ES_VERSION_3_2)
+            header += "precision highp usamplerBuffer;\n";
+
+        if (!GLAD_GL_EXT_blend_func_extended && !GLAD_GL_ARB_blend_func_extended)
+        {
+            if (!GLAD_GL_ARM_shader_framebuffer_fetch)
+                fprintf(stderr, "Dual source blending is not supported\n");
+
+            header += "#define DISABLE_DUAL_SOURCE\n";
+        }
+    }
+    else {
 		// Intel's GL driver doesn't like the readonly qualifier with 3.3 GLSL.
-		header = "#version 430 core\n";
+		if (m_features.vs_expand && GLAD_GL_VERSION_4_3)
+		{
+			header = "#version 430 core\n";
+		}
+		else
+		{
+			header = "#version 330 core\n";
+			header += "#extension GL_ARB_shading_language_420pack : require\n";
+			if (GLAD_GL_ARB_gpu_shader5)
+				header += "#extension GL_ARB_gpu_shader5 : require\n";
+			if (m_features.vs_expand)
+				header += "#extension GL_ARB_shader_storage_buffer_object: require\n";
+		}
+
+		if (m_features.framebuffer_fetch && GLAD_GL_EXT_shader_framebuffer_fetch)
+			header += "#extension GL_EXT_shader_framebuffer_fetch : require\n";
+
 	}
 
 	if (m_features.framebuffer_fetch)
@@ -1690,10 +1740,26 @@ std::string GSDeviceOGL::GenGlslHeader(const std::string_view entry, GLenum type
 		header += "#define DEPTH_FEEDBACK_SUPPORT 2\n"; // Depth as RT
 	}
 
-	if (GLAD_GL_ARB_clip_control)
+	if (!m_is_gles && GLAD_GL_ARB_clip_control)
 		header += "#define HAS_CLIP_CONTROL 1\n";
 	else
 		header += "#define HAS_CLIP_CONTROL 0\n";
+
+	// GLES compilers (Tegra/Adreno/Mali) reject implicit float->int in ivec2(vec2).
+	if (m_is_gles)
+	{
+		header += "#define GS_FRAGCOORD_ICOORD ivec2(int(gl_FragCoord.x), int(gl_FragCoord.y))\n";
+		header += "#define GS_FRAGCOORD_ICOORD_OFF(off) ivec2(int(gl_FragCoord.x + (off).x), int(gl_FragCoord.y + (off).y))\n";
+		header += "#define GS_FRAGCOORD_ICOORD_SCALED(s) ivec2(int(gl_FragCoord.x * (s)), int(gl_FragCoord.y * (s)))\n";
+		header += "#define GS_IVEC2_FROM_VEC2(v) ivec2(int((v).x), int((v).y))\n";
+	}
+	else
+	{
+		header += "#define GS_FRAGCOORD_ICOORD ivec2(gl_FragCoord.xy)\n";
+		header += "#define GS_FRAGCOORD_ICOORD_OFF(off) ivec2(gl_FragCoord.xy + (off))\n";
+		header += "#define GS_FRAGCOORD_ICOORD_SCALED(s) ivec2(gl_FragCoord.xy * (s))\n";
+		header += "#define GS_IVEC2_FROM_VEC2(v) ivec2(v)\n";
+	}
 
 	// Allow to puts several shader in 1 files
 	switch (type)
@@ -3277,6 +3343,7 @@ void GSDeviceOGL::RenderHW(GSHWDrawConfig& config)
 		{
 			OMSetBlendState();
 		}
+		const bool one_barrier = config.alpha_second_pass.require_one_barrier && m_features.feedback_loops();
 		SetupOM(config.alpha_second_pass.depth);
 		SendHWDraw(config, rt_feedbackloop_pass2 ? draw_rt_clone : nullptr, draw_rt, ds_feedbackloop_pass2 ? draw_ds_clone : nullptr, draw_ds,
 			one_barrier, config.alpha_second_pass.require_full_barrier);

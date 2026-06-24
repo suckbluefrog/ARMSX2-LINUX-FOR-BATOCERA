@@ -112,7 +112,7 @@ if("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "x86_64" OR "${CMAKE_HOST_SYSTEM_PR
 	endif()
 elseif("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "aarch64" OR
        "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "arm64")
-	message(STATUS "Building for Apple Silicon (ARM64).")
+	message(STATUS "Building for ARM64.")
 	set(ARCH_ARM64 TRUE)
 	if(APPLE)
 		# Min spec is an M1

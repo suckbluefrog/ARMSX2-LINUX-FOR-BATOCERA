@@ -1897,6 +1897,11 @@ void mVU_XGKICK_(u32 addr)
 {
 	if (s_mvuShadowRun) // DEBUG shadow run: don't transfer to GS (see MVU_DIFF)
 		return;
+#if defined(__ANDROID__) && ARMSX2_ANDROID_VU_PROBES
+	static u32 s_mvu_xgkick_direct_sample = 0;
+	const bool sample_xgkick = ((++s_mvu_xgkick_direct_sample & 0x3f) == 0);
+	const u64 xgkick_start = sample_xgkick ? Common::Timer::GetCurrentValue() : 0;
+#endif
 	addr = (addr & 0x3ff) * 16;
 	u32 diff = 0x4000 - addr;
 	u32 size = gifUnit.GetGSPacketSize(GIF_PATH_1, vuRegs[1].Mem, addr, ~0u, true);
@@ -1910,12 +1915,29 @@ void mVU_XGKICK_(u32 addr)
 	{
 		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[addr], size, true);
 	}
+#if defined(__ANDROID__) && ARMSX2_ANDROID_VU_PROBES
+	if (sample_xgkick)
+	{
+		const u64 elapsed = Common::Timer::GetCurrentValue() - xgkick_start;
+		Console.WriteLnFmt("@@MVU_XGKICK_DIRECT@@ bytes={} wrapped={} usec={:.2f}",
+			size, size > diff, Common::Timer::ConvertValueToSeconds(elapsed) * 1000000.0);
+	}
+#endif
 }
 
 void _vuXGKICKTransfermVU(bool flush)
 {
 	if (s_mvuShadowRun) // DEBUG shadow run: don't transfer to GS (see MVU_DIFF)
 		return;
+#if defined(__ANDROID__) && ARMSX2_ANDROID_VU_PROBES
+	static u32 s_mvu_xgkick_sample = 0;
+	const bool sample_xgkick = ((++s_mvu_xgkick_sample & 0x3f) == 0);
+	const u64 xgkick_start = sample_xgkick ? Common::Timer::GetCurrentValue() : 0;
+	u32 sample_loops = 0;
+	u32 sample_bytes = 0;
+	u32 sample_direct = 0;
+	u32 sample_copied = 0;
+#endif
 	while (VU1.xgkickenable && (flush || VU1.xgkickcyclecount >= 2))
 	{
 		u32 transfersize = 0;
@@ -1950,14 +1972,29 @@ void _vuXGKICKTransfermVU(bool flush)
 		if (THREAD_VU1)
 		{
 			if (transfersize < VU1.xgkicksizeremaining)
+			{
 				gifUnit.gifPath[GIF_PATH_1].CopyGSPacketData(&VU1.Mem[VU1.xgkickaddr], transfersize, true);
+			}
 			else
+			{
 				gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize, true);
+			}
 		}
 		else
 		{
 			gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize, true);
 		}
+#if defined(__ANDROID__) && ARMSX2_ANDROID_VU_PROBES
+		if (sample_xgkick)
+		{
+			sample_loops++;
+			sample_bytes += transfersize;
+			if (THREAD_VU1 && transfersize < VU1.xgkicksizeremaining)
+				sample_copied++;
+			else
+				sample_direct++;
+		}
+#endif
 
 		if (flush)
 			VU1.cycle += transfersize / 8;
@@ -1973,6 +2010,15 @@ void _vuXGKICKTransfermVU(bool flush)
 			VU1.xgkickenable = false;
 		}
 	}
+#if defined(__ANDROID__) && ARMSX2_ANDROID_VU_PROBES
+	if (sample_xgkick)
+	{
+		const u64 elapsed = Common::Timer::GetCurrentValue() - xgkick_start;
+		Console.WriteLnFmt("@@MVU_XGKICK_SYNC@@ flush={} loops={} bytes={} copied={} direct={} remaining={} usec={:.2f}",
+			flush, sample_loops, sample_bytes, sample_copied, sample_direct, VU1.xgkicksizeremaining,
+			Common::Timer::ConvertValueToSeconds(elapsed) * 1000000.0);
+	}
+#endif
 }
 
 static __fi void mVU_XGKICK_SYNC(mV, bool flush)

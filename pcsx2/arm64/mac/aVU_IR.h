@@ -36,7 +36,6 @@
 
 #include <array>
 
-
 namespace pcsx2_macrec {
 
 namespace a64 = vixl::aarch64;
@@ -102,21 +101,24 @@ static inline void mVUshufflePS(const a64::VRegister& dst, const a64::VRegister&
 }
 
 // Lane0-preserving scalar FP ops on the PQ latency reg (mVU_xmmPQ). AArch64 scalar
-// FP writes Sd and zeroes Vd[127:32], while x86 SSE scalar ops preserve the upper
-// three lanes. EFU P-pipe ops depend on the two Q instances and the other P
-// instance surviving, so compute in scratch and merge only lane0 back.
+// FP (Fsqrt/Fadd/Fmul on .S()) writes Sd and ZEROES Vd[127:32]; x86 SSE scalar ops
+// (SQRTSS/ADDSS/MULSS) preserve the upper 3 lanes. The EFU P-pipe ops shuffle the
+// target P instance into lane0, compute there, then shuffle back, and DEPEND on the
+// other 3 lanes (the two Q instances + the other P instance) surviving — writing
+// mVU_xmmPQ.S() in place wipes them, so a later MULq reads Q=0 (→ unprojected
+// geometry, e.g. MGS2's broken polygons). Compute into a scratch and merge only
+// lane0 back. q31 (RQSCRATCH2) is outside the regalloc pool (v0..v23) and not used
+// by the EFU sequences (which use q30 via mVUclampedArith / q29 via mVUshufflePS).
 static inline void mVUscalarSqrtKeep(const a64::VRegister& dst, const a64::VRegister& src)
 {
 	armAsm->Fsqrt(RQSCRATCH2.S(), src.S());
 	armAsm->Ins(dst.V4S(), 0, RQSCRATCH2.V4S(), 0);
 }
-
 static inline void mVUscalarAddKeep(const a64::VRegister& dst, const a64::VRegister& a, const a64::VRegister& b)
 {
 	armAsm->Fadd(RQSCRATCH2.S(), a.S(), b.S());
 	armAsm->Ins(dst.V4S(), 0, RQSCRATCH2.V4S(), 0);
 }
-
 static inline void mVUscalarMulKeep(const a64::VRegister& dst, const a64::VRegister& a, const a64::VRegister& b)
 {
 	armAsm->Fmul(RQSCRATCH2.S(), a.S(), b.S());
@@ -393,6 +395,25 @@ public:
 			clearGPR(i);
 
 		counter = 0;
+
+		// Macro (COP2) mode VI GPR pool gate (M5.4). When microVU0 emits a macro op
+		// memory-backed from inside the EE recompiler (mVU.cop2 != 0), allocGPR must
+		// not hand out the EE rec's own pinned host registers or it clobbers live EE
+		// state for the rest of the block. The EE rec pins x19 (RESTATEPTR — already
+		// excluded as index 19 in the ctor), x21 (REVTLBPTR = vtlb vmap base, loaded
+		// once at block entry and NEVER reloaded), and x20/x22/x23-x28 (the guest-GPR
+		// cache, REC_GPR_CACHE_REGS in aR5900.cpp). Of the cache regs, x23-x26 already
+		// coincide with mVU_F0-F3 (excluded in the ctor) and x27/x28 are outside the
+		// w0-w26 tracked range, so only x20/x21/x22 (indices 20/21/22) need a runtime
+		// gate. In the standalone VU rec (cop2 == 0) all three stay usable — this is a
+		// true no-op there. Only VU0 ever runs macro mode (microVU1.cop2 is always 0).
+		// setupMacroOp sets cop2 = 1 BEFORE calling reset(); endMacroOp sets it back to
+		// 0 before its reset(), so the pool is reconfigured correctly at each bracket.
+		microVU& mVU = index ? microVU1 : microVU0;
+		const bool macroMode = (mVU.cop2 != 0);
+		gprMap[20].usable = !macroMode;
+		gprMap[21].usable = !macroMode;
+		gprMap[22].usable = !macroMode;
 	}
 
 	int getXmmCount()
@@ -578,12 +599,6 @@ public:
 
 		if ((mapX.VFreg > 0) && mapX.xyzw) // Reg was modified and not Temp or vf0
 		{
-			extern bool g_mvuDiffActive;
-			if (g_mvuDiffActive && index == 1 && (mapX.VFreg == 17 || mapX.VFreg == 24))
-			{
-				microVU& mVU = microVU1;
-				DevCon.Error("WB VF%02d xyzw=%x v%d @pc=%04x", mapX.VFreg, mapX.xyzw, reg.GetCode(), (mVU.prog.IRinfo.curPC / 2) * 8);
-			}
 			if (mapX.VFreg == 33)
 				armAsm->Str(reg.S(), a64::MemOperand(RVUSTATE, mVUoffI));
 			else if (mapX.VFreg == 32)
@@ -686,15 +701,6 @@ public:
 	const a64::VRegister allocReg(int vfLoadReg = -1, int vfWriteReg = -1, int xyzw = 0, bool cloneWrite = true)
 	{
 		counter++;
-		{
-			extern bool g_mvuDiffActive;
-			if (g_mvuDiffActive && index == 1 &&
-				(vfLoadReg == 17 || vfLoadReg == 24 || vfWriteReg == 17 || vfWriteReg == 24))
-			{
-				microVU& mVU = microVU1;
-				Console.WriteLn("ALLOC load=%d write=%d xyzw=%x clone=%d @pc=%04x", vfLoadReg, vfWriteReg, xyzw, (int)cloneWrite, (mVU.prog.IRinfo.curPC / 2) * 8);
-			}
-		}
 		if (vfLoadReg >= 0) // Search For Cached Regs
 		{
 			for (int i = 0; i < xmmTotal; i++)
@@ -1007,6 +1013,5 @@ private:
 	// writes back every cached VF reg before a call.
 	static bool vfIsCallerSaved([[maybe_unused]] int i) { return true; }
 };
-
 
 } // namespace pcsx2_macrec

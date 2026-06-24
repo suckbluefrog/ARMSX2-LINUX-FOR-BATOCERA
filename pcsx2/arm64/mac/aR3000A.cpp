@@ -1149,8 +1149,31 @@ static s32 recExecuteBlock(s32 eeCycles)
 
 	iopRecExecuting = true;
 
+	// Bail the IOP slice on a STOP/SHUTDOWN request. PS2 titles spend long
+	// stretches inside this IOP loop, and the EE's own exit check only runs in
+	// recEventTest *after* this call returns — so without bailing here a shutdown
+	// that lands mid-slice never gets back to that check and the CPU thread hangs
+	// (the shutdown 5s-timeout symptom). Only Stop/Shutdown, NOT Paused: pausing
+	// must leave the thread parked where it was (bailing on pause regressed
+	// in-game settings into a crash).
+	//
+	// Perf: poll only on entry and then once every 64 blocks rather than every
+	// block. VMManager::GetState() is an atomic acquire-load, and the IOP runs
+	// this loop millions of times a second — reading it per block was pure
+	// EE-thread overhead during normal play. The slice is bounded and 64 IOP
+	// blocks is only a few microseconds, so a stop still unwinds promptly. The
+	// state read is race-free; nothing here writes psxRegs.
+	u32 stop_poll = 0;
+
 	while (psxRegs.iopCycleEE > 0)
 	{
+		if ((stop_poll++ & 63u) == 0)
+		{
+			const VMState st = VMManager::GetState();
+			if (st == VMState::Stopping || st == VMState::Shutdown)
+				break;
+		}
+
 		if (iopRecNeedsReset)
 			recResetRaw();
 

@@ -24,8 +24,17 @@
 
 static bool ShouldPreferESContext()
 {
+#if defined(__linux__) && defined(ARCH_ARM64)
+	// Handheld SoCs (Adreno/Mali) ship GLES drivers that are more reliable than
+	// desktop GL profiles on the same device. Allow opt-out with PREFER_GLES_CONTEXT=0.
+	const char* value = std::getenv("PREFER_GLES_CONTEXT");
+	if (value && std::strcmp(value, "0") == 0)
+		return false;
+	return true;
+#else
 	const char* value = std::getenv("PREFER_GLES_CONTEXT");
 	return (value && std::strcmp(value, "1") == 0);
+#endif
 }
 
 GLContext::GLContext(const WindowInfo& wi)

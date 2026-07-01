@@ -1392,8 +1392,34 @@ void InputManager::SetUSBVibrationIntensity(u32 port, float large_or_single_moto
 	SetPadVibrationIntensity(Pad::NUM_CONTROLLER_PORTS + port, large_or_single_motor_intensity, small_motor_intensity);
 }
 
+#ifdef __ANDROID__
+// Defined in native-lib.cpp — routes rumble to the active Android gamepad's
+// vibrator. The s_pad_vibration_array path below is dead on Android: SDL (the
+// only vibration-capable input source) fails to initialize, so no motor is
+// ever bound and the loop does nothing.
+namespace Native { void onPadRumble(int pad, int largeMotor, int smallMotor); }
+#endif
+
 void InputManager::SetPadVibrationIntensity(u32 pad_index, float large_or_single_motor_intensity, float small_motor_intensity)
 {
+#ifdef __ANDROID__
+	{
+		// De-dup so we only cross JNI when the intensity actually changes.
+		static float s_android_last_large[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+		static float s_android_last_small[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+		const u32 i = (pad_index < 8) ? pad_index : 0u;
+		if (s_android_last_large[i] != large_or_single_motor_intensity ||
+			s_android_last_small[i] != small_motor_intensity)
+		{
+			s_android_last_large[i] = large_or_single_motor_intensity;
+			s_android_last_small[i] = small_motor_intensity;
+			Native::onPadRumble(
+				static_cast<int>(i), // PS2 port / unified slot (0 = P1, 1 = P2)
+				static_cast<int>(large_or_single_motor_intensity * 255.0f),
+				static_cast<int>(small_motor_intensity * 255.0f));
+		}
+	}
+#endif
 	for (PadVibrationBinding& pad : s_pad_vibration_array)
 	{
 		if (pad.pad_index != pad_index)

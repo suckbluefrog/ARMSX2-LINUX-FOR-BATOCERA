@@ -28,6 +28,17 @@ object PatchRepo {
     private const val TREE_URL = "https://api.github.com/repos/PCSX2/pcsx2_patches/git/trees/main?recursive=1"
     private const val USER_AGENT = "ARMSX2"
 
+    // Gabominated's compilation fork — a SECOND patch source that adds improvement
+    // patches the official DB lacks (No-Interlace, 60 FPS, and per-game fixes like
+    // Mortal Kombat: Shaolin Monks' "Disable Blur/Bloom", which fixes the doubled-image
+    // ghosting PCSX2's HW renderer can't avoid). Same <SERIAL>_<CRC>.pnach naming, under
+    // a "PCSX2 Patches/" folder (note the space -> %20). Entries are MERGED with the
+    // official DB's in the browser (deduped by name; official wins on a name clash).
+    private const val GABO_BASE = "https://raw.githubusercontent.com/Gabominated/PCSX2/main"
+    private const val GABO_TREE = "https://api.github.com/repos/Gabominated/PCSX2/git/trees/main?recursive=1"
+    private const val GABO_DIR = "PCSX2%20Patches"
+    @Volatile private var gaboTreeCache: List<String>? = null
+
     // Cheat codes — the PCSX2 DB hosts none, so we pull from community
     // collections. They use mixed naming (<CRC>.pnach and <SERIAL>_<CRC>.pnach,
     // some in subfolders), so we match against each repo's file tree by CRC
@@ -101,6 +112,17 @@ object PatchRepo {
             if (gametitle.isEmpty()) gametitle = gt
             entries += es
             break // first existing patches file wins
+        }
+
+        // Also merge improvement patches from the Gabominated compilation (No-Blur etc.),
+        // skipping any whose name already came from the official DB.
+        for (name in patchCandidates) {
+            val text = get("$GABO_BASE/$GABO_DIR/$name.pnach") ?: continue
+            val (gt, es) = parse(text, "patches")
+            if (gametitle.isEmpty()) gametitle = gt
+            val seen = entries.mapTo(HashSet()) { it.name }
+            for (e in es) if (seen.add(e.name)) entries += e
+            break
         }
 
         // Cheats (community DBs).
@@ -186,6 +208,20 @@ object PatchRepo {
                 .uppercase()
         }
 
+        // Gabominated improvement patches (matched by serial in its file tree).
+        gaboTree().firstOrNull { it.substringAfterLast('/').startsWith("${s}_", ignoreCase = true) }
+            ?.let { gm ->
+                get("$GABO_BASE/${gm.replace(" ", "%20")}")?.let { text ->
+                    val (gt, es) = parse(text, "patches")
+                    if (gametitle.isEmpty()) gametitle = gt
+                    val seen = entries.mapTo(HashSet()) { it.name }
+                    for (e in es) if (seen.add(e.name)) entries += e
+                }
+                if (resolvedCrc.isEmpty())
+                    resolvedCrc = gm.substringAfterLast('/').removeSuffix(".pnach")
+                        .substringAfter("${s}_", "").substringBefore('_').uppercase()
+            }
+
         // Cheats: matched by CRC (from the patches filename) or by serial.
         fetchCheats(s, resolvedCrc)?.let { (gt, es) ->
             if (gametitle.isEmpty()) gametitle = gt
@@ -195,6 +231,15 @@ object PatchRepo {
         if (entries.isEmpty())
             return Result("", emptyList(), "No patches or cheats in the database for $s.")
         return Result(gametitle, entries, null, s, resolvedCrc)
+    }
+
+    /** File listing of the Gabominated patch fork, cached for the session. */
+    private fun gaboTree(): List<String> {
+        gaboTreeCache?.let { return it }
+        val json = get(GABO_TREE) ?: return emptyList()
+        val paths = TREE_PATH_RE.findAll(json).map { it.groupValues[1] }.toList()
+        if (paths.isNotEmpty()) gaboTreeCache = paths
+        return paths
     }
 
     /** File listing of the whole patch repo, cached for the session. */

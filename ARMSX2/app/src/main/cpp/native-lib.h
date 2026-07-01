@@ -9,4 +9,7 @@
 
 namespace Native {
     void vmSetPaused(bool select_directory);
+    // PS2 pad rumble -> that player's Android gamepad vibrator (pad = unified slot,
+    // 0 = P1 / 1 = P2). Motors are 0..255.
+    void onPadRumble(int pad, int largeMotor, int smallMotor);
 }

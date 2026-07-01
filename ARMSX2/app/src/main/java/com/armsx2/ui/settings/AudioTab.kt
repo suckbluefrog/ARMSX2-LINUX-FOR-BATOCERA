@@ -41,9 +41,10 @@ fun AudioTab(state: MutableState<Settings>) {
         )
         IntSliderRow(
             label = "Volume",
-            value = s.audioVolume.coerceIn(0, 100),
+            value = s.audioVolume.coerceIn(0, 150),
             min = 0,
-            max = 100,
+            max = 150,
+            description = "Above 100% boosts/amplifies SPU2 output — handy for quiet games, but very high levels can distort/clip.",
             valueFormatter = { "$it%" },
             onChange = { apply(s.copy(audioVolume = it)) },
         )
@@ -51,9 +52,9 @@ fun AudioTab(state: MutableState<Settings>) {
         ToggleRow("Mute", s.audioMuted) { apply(s.copy(audioMuted = it)) }
         SettingsDivider()
         ToggleRow(
-            "Time Stretch",
+            "Audio Synchronization",
             s.audioTimeStretch,
-            description = "Keeps audio pitch stable when emulation speed varies. Off = a bit less CPU, but pitch/clock can drift under load.",
+            description = "Time Stretch — keeps audio pitch stable when emulation speed varies (PCSX2 2.7 \"Synchronization\"). Off = a bit less CPU, but pitch/clock can drift under load.",
         ) { apply(s.copy(audioTimeStretch = it)) }
         SettingsDivider()
         IntSliderRow(
@@ -85,5 +86,11 @@ fun AudioTab(state: MutableState<Settings>) {
             valueFormatter = { "$it%" },
             onChange = { apply(s.copy(audioFastForwardVolume = it)) },
         )
+        SettingsDivider()
+        ToggleRow(
+            "SPU2 SIMD audio (experimental)",
+            s.spu2NeonReverb,
+            description = "NEON fast path for reverb audio processing — frees up CPU, which can help performance on CPU-limited devices. Off (default) uses the standard path with unchanged audio. Reboot the game to switch.",
+        ) { apply(s.copy(spu2NeonReverb = it)) }
     }
 }

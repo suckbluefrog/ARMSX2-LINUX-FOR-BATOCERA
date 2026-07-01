@@ -23,6 +23,7 @@
 #include "VU.h"
 #include "VUmicro.h"
 #include "vtlb.h"
+#include "AndroidEEOpHist.h"
 
 #include "common/Assertions.h"
 #include "common/Console.h"
@@ -144,6 +145,11 @@ static constexpr u32 EE_NEXTEVENTCYCLE_OFFSET = static_cast<u32>(offsetof(cpuReg
 static constexpr u32 EE_HI_SCALAR_OFFSET = 32u * 16u;
 static constexpr u32 EE_LO_SCALAR_OFFSET = 33u * 16u;
 
+// Byte offset of cpuRegs.CP0.n.Status (the COP0 interrupt/mode status word the DI
+// generator clears Status.EIE in — see recEmitCop0DI).
+static constexpr u32 EE_COP0_STATUS_OFFSET =
+	static_cast<u32>(offsetof(cpuRegisters, CP0) + offsetof(CP0regs, n.Status));
+
 // Dynamically-generated dispatcher stubs (emitted into the head of the code cache by
 // recGenDispatchers on every reset; addresses are stable across a reset because the
 // stubs regenerate byte-identically at the same location — see recRecompile).
@@ -169,6 +175,12 @@ static bool eeRecNeedsReset = false;
 static std::atomic_bool eeRecExitRequested{false};
 static volatile u8 eeRecExitSignal = 0;
 static jmp_buf s_jmp_buf;
+// Landing pad for Cpu->CancelInstruction() raised by an interpreter single-step
+// (intExecuteOneInst) op — e.g. a MIPS trap (TGE/TNE/...) whose condition is met.
+// Distinct from s_jmp_buf: s_jmp_buf EXITS recExecute, this one re-dispatches so EE
+// execution continues. Mirrors the old arm64 backend's m_SetJmp_CancelInstruction
+// and the interpreter's intCancelInstruction (Interpreter.cpp).
+static jmp_buf s_cancel_jmp_buf;
 
 static void recResetRaw();
 static void recGenDispatchers();
@@ -350,6 +362,7 @@ enum : u32
 
 // Defined below (block-compile helpers) — used by recTranslateOp's COP2 inline path.
 static void recEmitInterpInline(u32 op);
+static void recEmitWritePc(u32 pc);
 static bool recTranslateOp(u32 op);
 
 // Macro-mode native COP2 transfer ops (defined after the M2 sync helpers) — used by
@@ -2082,18 +2095,32 @@ static bool recTranslateOp(u32 op)
 				case 0x19: armEmitMULTU(rd, rs, rt); return true;
 				case 0x1A: armEmitDIV(rs, rt); return true;
 				case 0x1B: armEmitDIVU(rs, rt); return true;
+				// SYNC (funct 0x0f): a pipeline/memory barrier whose interpreter body
+				// is EMPTY in this emulator (no EE pipeline/cache modelled — see
+				// R5900OpcodeImpl SYNC()). Emit nothing instead of block-terminating
+				// and single-stepping it. By far the dominant EE fallback op in real
+				// games (The Getaway: ~59% of all single-stepped ops were SYNC).
+				case 0x0f: return true;
 				default:   return false;
 			}
 
-		// MMI — second-pipeline multiply/divide (Phase 3.5). Other MMI ops (SIMD,
-		// MFHI1/MFLO1, ...) are not yet implemented and fall through to false.
+		// MMI — second-pipeline multiply/divide (Phase 3.5) + multiply-accumulate
+		// and the pipeline-1 HI/LO moves. Remaining MMI ops fall through to false.
 		case 0x1C:
 			switch (funct)
 			{
+				case 0x00: armEmitMADD(rd, rs, rt); return true;   // MADD
+				case 0x01: armEmitMADDU(rd, rs, rt); return true;  // MADDU
+				case 0x10: armEmitMFHI1(rd); return true;          // MFHI1
+				case 0x11: armEmitMTHI1(rs); return true;          // MTHI1
+				case 0x12: armEmitMFLO1(rd); return true;          // MFLO1
+				case 0x13: armEmitMTLO1(rs); return true;          // MTLO1
 				case 0x18: armEmitMULT1(rd, rs, rt); return true;
 				case 0x19: armEmitMULTU1(rd, rs, rt); return true;
 				case 0x1A: armEmitDIV1(rs, rt); return true;
 				case 0x1B: armEmitDIVU1(rs, rt); return true;
+				case 0x20: armEmitMADD1(rd, rs, rt); return true;  // MADD1
+				case 0x21: armEmitMADDU1(rd, rs, rt); return true; // MADDU1
 				// Direct tbl_MMI entries (indexed by funct = op & 0x3F).
 				case 0x04: armEmitPLZCW(rd, rs); return true;
 				// MMI0/1/2/3 SIMD sub-groups (Phase 5.4); sub-op in `sa`.
@@ -2161,6 +2188,12 @@ static bool recTranslateOp(u32 op)
 				default: return false;
 			}
 
+		// REGIMM — rt-field selector. Only the trap-immediates are native here; the
+		// BLTZ/BGEZ/... branches are emitted by the branch path (block-terminating) and
+		// never reach recTranslateOp. Unhandled rt values fall through to false.
+		case 0x01:
+			return false;
+
 		// Immediate arithmetic (Phase 3.1)
 		case 0x08: armEmitADDI(rt, rs, imm); return true;
 		case 0x09: armEmitADDIU(rt, rs, imm); return true;
@@ -2199,6 +2232,15 @@ static bool recTranslateOp(u32 op)
 		case 0x1B: armEmitLDR(rt, rs, imm); return true;
 		case 0x2C: armEmitSDL(rt, rs, imm); return true;
 		case 0x2D: armEmitSDR(rt, rs, imm); return true;
+
+		// CACHE (0x2f): EE data-cache hint/maintenance. It DOES do real work in the
+		// interpreter (Cache.cpp CACHE(): line invalidate/writeback, writes CP0.TagLo)
+		// so it can't be a no-op — but it reads rs, writes no GPR, never touches
+		// cpuRegs.pc, and raises no exception, so inline-interpret it in-block exactly
+		// like the COP0 ops below instead of block-terminating + single-stepping. recTranslateOp
+		// runs after recCacheFlushAll, so cpuRegs holds the current rs for the handler.
+		// 2nd-most-dominant EE fallback op (The Getaway: ~39% of single-stepped ops).
+		case 0x2f: recEmitInterpInline(op); return true;
 
 		// 128-bit quadword load/store (16-byte aligned).
 		case OP_LQ: armEmitLoadQuad(rt, rs, imm); return true;
@@ -2395,6 +2437,14 @@ static bool recEmitBranch(u32 op, u32 branchpc)
 			}
 			return false; // BC2FL/BC2TL (likely) + COP2 transfer/macro ops (straight-line)
 
+		case 0x10: // COP0: BC0 branches live under rs==0x08 (BC); rt selects tf/likely.
+			if (rs == 0x08)
+			{
+				if (rt == 0x00) { armEmitBC0F(btarget, fallthrough); return true; }  // BC0F
+				if (rt == 0x01) { armEmitBC0T(btarget, fallthrough); return true; }  // BC0T
+			}
+			return false; // BC0FL/BC0TL (likely) + COP0 transfer/TLB/DI ops (handled elsewhere)
+
 		default: return false;
 	}
 }
@@ -2533,6 +2583,8 @@ static bool recIsHandledBranch(u32 op)
 			return rs == 0x08 && (rt == 0x00 || rt == 0x01);
 		case 0x12: // COP2: only BC2F/BC2T (rs==BC, rt 0/1); all other COP2 ops are straight-line/macro.
 			return rs == 0x08 && (rt == 0x00 || rt == 0x01);
+		case 0x10: // COP0: only BC0F/BC0T (rs==BC, rt 0/1); MFC0/MTC0/TLB/DI handled elsewhere.
+			return rs == 0x08 && (rt == 0x00 || rt == 0x01);
 		default:
 			return false;
 	}
@@ -2560,6 +2612,92 @@ static bool recIsLikelyBranch(u32 op)
 			return rs == 0x08 && (rt == 0x02 || rt == 0x03);
 		case 0x12: // COP2: BC2FL / BC2TL
 			return rs == 0x08 && (rt == 0x02 || rt == 0x03);
+		case 0x10: // COP0: BC0FL / BC0TL
+			return rs == 0x08 && (rt == 0x02 || rt == 0x03);
+		default:
+			return false;
+	}
+}
+
+// COP0 DI (disable interrupts): COP0, CO (rs==0x10), funct 0x39.
+static bool recIsCop0DI(u32 op)
+{
+	return (op >> 26) == 0x10 && ((op >> 21) & 0x1f) == 0x10 && (op & 0x3f) == 0x39;
+}
+
+// COP0 EI (enable interrupts, funct 0x38) / ERET (exception return, funct 0x18) —
+// CO ops (rs==0x10). x86 compiles both via recBranchCall: end the block, run the
+// interpreter handler, then event-test + dispatch (EI so a now-unmasked pending IRQ
+// is serviced; ERET because it writes cpuRegs.pc). recRecompile handles them that way
+// instead of single-stepping (the top EE interpreter fallback after the BC0/MADD work).
+static bool recIsCop0EI(u32 op)
+{
+	return (op >> 26) == 0x10 && ((op >> 21) & 0x1f) == 0x10 && (op & 0x3f) == 0x38;
+}
+static bool recIsCop0ERET(u32 op)
+{
+	return (op >> 26) == 0x10 && ((op >> 21) & 0x1f) == 0x10 && (op & 0x3f) == 0x18;
+}
+static bool recIsCop0EIorERET(u32 op)
+{
+	return recIsCop0EI(op) || recIsCop0ERET(op);
+}
+
+// MIPS trap ops: SPECIAL T{GE,GEU,LT,LTU,EQ,NE} (funct 0x30-0x34,0x36) and REGIMM
+// T{GE,GEU,LT,LTU,EQ,NE}I (rt 0x08-0x0C,0x0E). Emitted natively (block-conditional)
+// in recRecompile — see recEmitTrapCompareIfTrap.
+static bool recIsTrap(u32 op)
+{
+	const u32 opcode = op >> 26;
+	if (opcode == 0x00)
+	{
+		const u32 funct = op & 0x3f;
+		return funct == 0x30 || funct == 0x31 || funct == 0x32 ||
+		       funct == 0x33 || funct == 0x34 || funct == 0x36;
+	}
+	if (opcode == 0x01)
+	{
+		const u32 rt = (op >> 16) & 0x1f;
+		return rt == 0x08 || rt == 0x09 || rt == 0x0A ||
+		       rt == 0x0B || rt == 0x0C || rt == 0x0E;
+	}
+	return false;
+}
+
+// Can `op` be safely emitted inline as DI's one-instruction-delayed slot? The x86
+// recDI compiles whatever follows DI before applying the interrupt-disable; on this
+// rec the delayed op is emitted straight-line via recEmitOp (native, else inline
+// interpreter), so it must be an op that is correct to splice mid-block in program
+// order. That excludes control-flow / PC-writing / interrupt-gating / exception-
+// raising / cycle-sensitive ops, for which we instead end the block at DI and let it
+// single-step (DI then applies immediately — an accepted corner; a benign straight-
+// line op is what virtually always follows a DI). Branches are caught by the
+// recIsHandledBranch / recIsLikelyBranch checks the caller already does.
+static bool recCop0DelayOpUnsafe(u32 op)
+{
+	const u32 opcode = op >> 26;
+	const u32 funct = op & 0x3f;
+	const u32 rs = (op >> 21) & 0x1f;
+	const u32 rt = (op >> 16) & 0x1f;
+	const u32 rd = (op >> 11) & 0x1f;
+	switch (opcode)
+	{
+		case 0x00: // SPECIAL: SYSCALL / BREAK / traps (JR/JALR already caught as branches)
+			return funct == 0x0C || funct == 0x0D || (funct >= 0x30 && funct <= 0x37);
+		case 0x01: // REGIMM traps: TGEI/TGEIU/TLTI/TLTIU/TEQI/TNEI (rt 0x08-0x0F)
+			return rt >= 0x08 && rt <= 0x0F;
+		case 0x10: // COP0: BC0 (rs 0x08); CO ERET/EI/DI/WAIT; cycle-sensitive Count/PERF
+			if (rs == 0x08)
+				return true;
+			if (rs == 0x10) // CO
+				return funct == 0x18 || funct == 0x38 || funct == 0x39 || funct == 0x20;
+			if ((rs == 0x00 || rs == 0x04) && (rd == 9 || rd == 25))
+				return true;
+			return false;
+		case 0x12: // COP2 / VU0 macro — keep off the inline delay path
+		case 0x36: // LQC2 — VU0-syncing
+		case 0x3E: // SQC2 — VU0-syncing
+			return true;
 		default:
 			return false;
 	}
@@ -2713,6 +2851,12 @@ static u32 recBranchConditionReads(u32 op)
 		case 0x06: case 0x07: return (1u << rs);      // BLEZ/BGTZ
 		case 0x01: // REGIMM: BLTZ/BGEZ only — the AL forms write a link register.
 			return (rt == 0x00 || rt == 0x01) ? (1u << rs) : 0xffffffffu;
+		case 0x10: // COP0: BC0F/BC0T read CPCOND0 (DMAC STAT/PCR), not GPRs -> 0 GPR reads.
+			// Lets the DMA-wait spin qualify as a wait-loop so the existing fast-forward
+			// idle-skips it (the big win). CPCOND0 flips only at event-scheduled DMA
+			// completion, so the skip lands exactly at the next event. Gated by the
+			// WaitLoop speedhack (BC0 is left conditional in recBranchIsUnconditional).
+			return (rs == 0x08 && (rt == 0x00 || rt == 0x01)) ? 0u : 0xffffffffu;
 		default: return 0xffffffffu;                  // anything else: not a candidate
 	}
 }
@@ -2742,7 +2886,43 @@ static void recEmitInterpInline(u32 op)
 {
 	armAsm->Mov(RSCRATCHADDR.W(), op);
 	armAsm->Str(RSCRATCHADDR.W(), a64::MemOperand(RESTATEPTR, EE_CODE_OFFSET));
+#if ARMSX2_ANDROID_EE_OPHIST
+	// Route every in-block interp call through the counting thunk so the INLINE
+	// fallback profile (COP2/VU0 etc.) is captured. It reads cpuRegs.code (set above).
+	armEmitCall(reinterpret_cast<const void*>(&recOphistInlineThunk));
+#else
 	armEmitCall(reinterpret_cast<const void*>(::R5900::GetInstruction(op).interpret));
+#endif
+}
+
+// COP0 DI — clear Status.EIE (disable interrupts) under the same condition as
+// Interpreter::COP0::DI and the x86 recDI (iCOP0.cpp): only when the CPU is in a
+// privileged context, i.e. (Status & (EXL|ERL|EDI)) != 0  ||  Status.KSU == 0.
+// This emits just the "DI takes effect" status update; the one-instruction delay
+// the x86 rec applies (recompileNextInstruction before this) is reproduced by the
+// caller in recRecompile, which emits the following guest instruction first.
+//
+// Emitted with only encodable logical immediates so VIXL never needs a scratch
+// register, and the status word is held in RSCRATCHADDR.W() (x17, removed from the
+// VIXL scratch pool in armStartBlock) — so it cannot be clobbered by an implicit
+// VIXL temp. Touches only cpuRegs.CP0.n.Status (no guest GPRs), so it is safe to
+// splice into the middle of a block after the delayed instruction.
+static void recEmitCop0DI()
+{
+	const a64::Register status = RSCRATCHADDR.W();
+	armAsm->Ldr(status, a64::MemOperand(RESTATEPTR, EE_COP0_STATUS_OFFSET));
+
+	a64::Label do_clear, done;
+	armAsm->Tst(status, 0x6);      // EXL | ERL set -> privileged, clear EIE
+	armAsm->B(&do_clear, a64::ne);
+	armAsm->Tst(status, 0x20000);  // EDI set -> clear EIE
+	armAsm->B(&do_clear, a64::ne);
+	armAsm->Tst(status, 0x18);     // KSU: non-zero == user/supervisor -> leave EIE
+	armAsm->B(&done, a64::ne);
+	armAsm->Bind(&do_clear);
+	armAsm->Bic(status, status, 0x10000); // EIE
+	armAsm->Str(status, a64::MemOperand(RESTATEPTR, EE_COP0_STATUS_OFFSET));
+	armAsm->Bind(&done);
 }
 
 // Compile one straight-line or delay-slot instruction: const-folded/native generator
@@ -2828,6 +3008,86 @@ static void recEmitCommitBlockCycles(u32 raw)
 	armAsm->Str(RXVIXLSCRATCH, a64::MemOperand(RESTATEPTR, EE_CYCLE_OFFSET));
 }
 
+// --------------------------------------------------------------------------------------
+//  MIPS trap opcodes — native codegen (block-conditional). The interpreter trap funcs
+//  (R5900OpcodeImpl.cpp) compute "if (cond) trap()", and trap() does cpuRegs.pc -= 4 then
+//  cpuException(0x34) which redirects pc to the exception vector. The recompiler can't
+//  continue straight-line through a taken trap, so this mirrors x86's recBranchCall
+//  treatment (block-terminating) — but only on the rare TAKEN path: we emit a native
+//  64-bit compare and branch OVER the raise block when the trap is NOT taken (the common
+//  case stays in-block, no dispatch). On the taken path we run the interpreter op (which
+//  raises), commit the block's cycles, and tail into DispatcherEvent to service events and
+//  re-dispatch from the new pc. The caller has already flushed+killed the GPR cache (so
+//  memory is authoritative for both the compare and the interpreter), exactly like a
+//  branch. RSCRATCHADDR(x17)=lhs, RXVIXLSCRATCH(x16)=rhs — dead scratch between ops; both
+//  are consumed by the Cmp before the raise block (which reuses x17) runs.
+//
+//  The skip condition passed in is the INVERSE of the interpreter's trap-if test:
+//   TGE/TGEI rs>=rt  -> skip lt   TGEU/TGEIU rs>=rt(u) -> skip lo
+//   TLT/TLTI rs<rt   -> skip ge   TLTU/TLTIU rs<rt(u)  -> skip hs
+//   TEQ/TEQI rs==rt  -> skip ne   TNE/TNEI   rs!=rt    -> skip eq
+static void recEmitTrapRegCompare(u32 rs, u32 rt, a64::Condition skip_cond, a64::Label* skip)
+{
+	armAsm->Ldr(RSCRATCHADDR, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs))); // GPR[rs].UD[0]
+	if (rt == 0)
+		armAsm->Cmp(RSCRATCHADDR, 0);
+	else
+	{
+		armAsm->Ldr(RXVIXLSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt))); // GPR[rt].UD[0]
+		armAsm->Cmp(RSCRATCHADDR, RXVIXLSCRATCH);
+	}
+	armAsm->B(skip, skip_cond);
+}
+
+static void recEmitTrapImmCompare(u32 rs, s32 imm, a64::Condition skip_cond, a64::Label* skip)
+{
+	armAsm->Ldr(RSCRATCHADDR, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs))); // GPR[rs].UD[0]
+	// _Imm_ is the sign-extended 16-bit immediate. The signed forms compare against the
+	// s64 value; the unsigned forms (TGEIU/TLTIU) compare (u64)_Imm_, which is the same
+	// bit pattern — only the branch condition differs.
+	armAsm->Mov(RXVIXLSCRATCH, static_cast<u64>(static_cast<s64>(imm)));
+	armAsm->Cmp(RSCRATCHADDR, RXVIXLSCRATCH);
+	armAsm->B(skip, skip_cond);
+}
+
+// Emits the trap-condition compare + "branch over the raise block when NOT taken" for a
+// trap op; returns false (emitting nothing) for a non-trap op. Decode mirrors recIsTrap.
+static bool recEmitTrapCompareIfTrap(u32 op, a64::Label* skip)
+{
+	const u32 opcode = op >> 26;
+	const u32 funct = op & 0x3f;
+	const u32 rs = (op >> 21) & 0x1f;
+	const u32 rt = (op >> 16) & 0x1f;
+	const s32 imm = static_cast<s16>(op);
+	if (opcode == 0x00) // SPECIAL register-form traps
+	{
+		switch (funct)
+		{
+			case 0x30: recEmitTrapRegCompare(rs, rt, a64::lt, skip); return true; // TGE
+			case 0x31: recEmitTrapRegCompare(rs, rt, a64::lo, skip); return true; // TGEU
+			case 0x32: recEmitTrapRegCompare(rs, rt, a64::ge, skip); return true; // TLT
+			case 0x33: recEmitTrapRegCompare(rs, rt, a64::hs, skip); return true; // TLTU
+			case 0x34: recEmitTrapRegCompare(rs, rt, a64::ne, skip); return true; // TEQ
+			case 0x36: recEmitTrapRegCompare(rs, rt, a64::eq, skip); return true; // TNE
+			default:   return false;
+		}
+	}
+	if (opcode == 0x01) // REGIMM immediate-form traps
+	{
+		switch (rt)
+		{
+			case 0x08: recEmitTrapImmCompare(rs, imm, a64::lt, skip); return true; // TGEI
+			case 0x09: recEmitTrapImmCompare(rs, imm, a64::lo, skip); return true; // TGEIU
+			case 0x0A: recEmitTrapImmCompare(rs, imm, a64::ge, skip); return true; // TLTI
+			case 0x0B: recEmitTrapImmCompare(rs, imm, a64::hs, skip); return true; // TLTIU
+			case 0x0C: recEmitTrapImmCompare(rs, imm, a64::ne, skip); return true; // TEQI
+			case 0x0E: recEmitTrapImmCompare(rs, imm, a64::eq, skip); return true; // TNEI
+			default:   return false;
+		}
+	}
+	return false;
+}
+
 // True for ops that run the interpreter inline AND need a live, current cpuRegs.cycle —
 // COP2 / VU0-macro ops (opcode 0x12, excluding the BC2 branches which already single-step).
 // The VU sync inside the COP2 handler reads cpuRegs.cycle, so the block's accumulated cycles
@@ -2855,6 +3115,26 @@ static bool recOpNeedsCycleFlush(u32 op)
 		return !recVUMacroIsMode0(op);
 	}
 	return (op >> 26) == OP_LQC2 || (op >> 26) == OP_SQC2;
+}
+
+// True for MFC0/MTC0 of the Count (rd 9) or PERF (rd 25) registers — the COP0 ops the EE
+// rec previously single-stepped (recTranslateOpOptimized returns false for them) because
+// they read a live cpuRegs.cycle this rec only flushes at the block tail. Games busy-poll
+// Count for timing, so the single-step path can dominate EE (Jackie Chan Adventures: ~80%
+// of EE fallbacks). recRecompile handles these by committing the block's accumulated cycles
+// before an INLINE interp call (so the read is live), instead of the expensive single-step.
+// Per-op commit also fixes the historic "two MFC0 Count in one block read the same stale
+// value -> games lock up" hazard: each read now advances cpuRegs.cycle. Excludes BC0 / ERET
+// / EI / DI / WAIT, which still single-step (they write PC or gate interrupts).
+static bool recCop0NeedsLiveCycle(u32 op)
+{
+	if ((op >> 26) != 0x10)
+		return false; // COP0
+	const u32 rs = (op >> 21) & 0x1f;
+	if (rs != 0x00 && rs != 0x04)
+		return false; // MFC0 / MTC0 only (BC0 rs==0x08 + C0 rs==0x10 keep their paths)
+	const u32 rd = (op >> 11) & 0x1f;
+	return (rd == 9 || rd == 25); // Count / PERF
 }
 
 // CALLMS (COP2 SPECIAL1 funct 0x38) / CALLMSR (0x39) — x86's only INTERPRETATE_COP2_FUNC ops
@@ -3606,6 +3886,48 @@ static u32 recScanBlockEnd(u32 startpc)
 	return pc;
 }
 
+// Skip MPEG game-fix (CHECK_SKIPMPEGHACK) — ported from the x86 rec's
+// skipMPEG_By_Pattern (ix86-32/iR5900.cpp). It was previously x86-only, so the
+// "Skip MPEG" toggle did nothing on Android (this ARM64 EE backend). The PS2
+// sceMpegIsEnd routine is a tiny 3-instruction leaf:
+//     lw reg, 0x40(a0) ; jr ra ; lw v0, 0(reg)
+// When the fix is on and a block starts exactly on that pattern, we don't
+// recompile it — we stub it to force v0 = 1 ("movie finished") and return to ra,
+// so games that spin waiting for an FMV to end skip it (Katamari et al.). The
+// pattern detection is architecture-independent; the host state change is done by
+// this C helper (called via armEmitCall) so no hand-emitted field writes are
+// needed, and the normal block finalize then event-tests + dispatches from the
+// cpuRegs.pc the helper set.
+static void eeSkipMpegIsEnd()
+{
+	cpuRegs.GPR.n.v0.UD[0] = 1;          // v0 = 1 (UL[0] = 1, UL[1] = 0)
+	cpuRegs.pc = cpuRegs.GPR.n.ra.UL[0]; // jr ra
+}
+
+// Returns true (and emits the stub call) when [startpc] is the sceMpegIsEnd leaf
+// and the fix is enabled. s_eeEndBlock must already be set (recScanBlockEnd).
+static bool recTrySkipMpeg(u32 startpc)
+{
+	if (!CHECK_SKIPMPEGHACK)
+		return false;
+
+	// Exactly three words, middle op == `jr ra` (0x03e00008).
+	if (s_eeEndBlock != startpc + 12 || memRead32(startpc + 4) != 0x03e00008u)
+		return false;
+
+	const u32 code = memRead32(startpc);
+	const u32 p1 = 0x8c800040u;                             // lw ?, 0x40(a0)
+	const u32 p2 = 0x8c020000u | ((code & 0x1f0000u) << 5); // lw v0, 0(reg)
+	if ((code & 0xffe0ffffu) != p1)
+		return false;
+	if (memRead32(startpc + 8) != p2)
+		return false;
+
+	armEmitCall(reinterpret_cast<const void*>(eeSkipMpegIsEnd));
+	Console.WriteLn("sceMpegIsEnd pattern found! Recompiling skip video fix... [ARM64]");
+	return true;
+}
+
 // --------------------------------------------------------------------------------------
 //  Block compiler (Phase 4.3 / 4.4)
 // --------------------------------------------------------------------------------------
@@ -3740,7 +4062,19 @@ static void recRecompile(u32 startpc)
 		}
 	}
 
-	for (;;)
+	// Skip MPEG game-fix: if enabled and this block IS the sceMpegIsEnd leaf, stub it
+	// (force v0=1 + jr ra) instead of recompiling, then fall straight into the normal
+	// block finalize/dispatch below — which resumes at cpuRegs.pc (= ra) the stub set.
+	const bool skipped_mpeg = recTrySkipMpeg(startpc);
+	if (skipped_mpeg)
+	{
+		endpc = s_eeEndBlock; // the 3-word leaf [startpc, startpc+12)
+		raw_cycles = eeOpCycles(memRead32(startpc)) + eeOpCycles(0x03e00008u) +
+			eeOpCycles(memRead32(startpc + 8));
+		// known_dispatch_pc stays false -> dispatch dynamically from cpuRegs.pc.
+	}
+
+	for (; !skipped_mpeg;)
 	{
 		// Keep every block within a single host RAM page so its SMC protection mode (see
 		// recEmitManualProtection) governs the whole block, and so a page-fault clear of
@@ -3764,6 +4098,94 @@ static void recRecompile(u32 startpc)
 			if (idx >= EE_INST_CACHE_SIZE)
 				idx = EE_INST_CACHE_SIZE - 1;
 			g_pCurInstInfo = &s_instCache[idx];
+		}
+
+		// COP0 DI — the interrupt-disable must take effect one instruction LATE, exactly as
+		// the x86 recDI (iCOP0.cpp): emit the *following* guest instruction first, then the
+		// Status.EIE clear. Without this delay several games disable IRQs one op too early
+		// and hang at boot (Jak X, Namco 50th Anniversary, SpongeBob the Movie / Battle for
+		// Bikini Bottom, The Incredibles (+ Rise of the Underminer), Soukou Kihei Armodyne,
+		// Garfield: Saving Arlene, Tales of Fandom Vol. 2). The delayed op is emitted
+		// straight-line in program order (recEmitOp), then recEmitCop0DI; the pair advances
+		// pc by 8. A DI in a branch delay slot never reaches here (delay slots go through
+		// recEmitOp, where DI inline-interprets immediately — matching x86's
+		// g_recompilingDelaySlot path). If the following op can't be safely spliced inline
+		// (control-flow / PC-writing / exception / cycle-sensitive), fall through to end the
+		// block at DI and single-step it (rare; DI then applies immediately).
+		if (recIsCop0DI(op))
+		{
+			const u32 next_op = memRead32(pc + 4);
+			if (!recIsHandledBranch(next_op) && !recIsLikelyBranch(next_op) &&
+				!recCop0DelayOpUnsafe(next_op))
+			{
+				raw_cycles += eeOpCycles(op);
+
+				// Compile the delayed instruction (point g_pCurInstInfo at its slot for any
+				// analysis-driven emit), then apply DI after it has executed.
+				{
+					u32 nidx = ((pc + 4) - startpc) >> 2;
+					if (nidx >= EE_INST_CACHE_SIZE)
+						nidx = EE_INST_CACHE_SIZE - 1;
+					g_pCurInstInfo = &s_instCache[nidx];
+				}
+				recEmitOp(next_op, const_state, cache_state);
+				recEmitCop0DI();
+				raw_cycles += eeOpCycles(next_op);
+
+				// A block containing a DI is not a poll loop.
+				waitloop_possible = false;
+				pc += 8;
+				endpc = pc;
+				compiled += 2;
+				if (compiled >= MAX_BLOCK_INSTS)
+				{
+					recEmitWritePc(pc);
+					known_dispatch_pc = true;
+					dispatch_pc = pc;
+					break;
+				}
+				continue;
+			}
+			// else: fall through — recTranslateOpOptimized(DI) returns false below, so the
+			// block ends here / single-steps DI (no cycles charged for DI on this path).
+		}
+
+		// MIPS trap ops (TGE/TLT/TEQ/TNE + immediate forms). Native, block-conditional:
+		// emit a compare and, when the trap is NOT taken (the overwhelmingly common case),
+		// branch over the raise block and STAY in-block — no block-terminate, no dispatch
+		// round-trip (the regression that made these single-step every execution). On the
+		// rare taken path we run the interpreter op (which raises via cpuException, setting
+		// cpuRegs.pc to the exception vector), commit the block's cycles, and tail into the
+		// dispatcher — mirroring x86's recBranchCall, but only for the taken path. We must
+		// make memory authoritative first (the compare reads guest GPRs; the taken path's
+		// interpreter reads cpuRegs), so flush + kill the GPR/const cache exactly as a
+		// block-terminating branch does.
+		if (recIsTrap(op))
+		{
+			raw_cycles += eeOpCycles(op);
+			recCacheFlushAll(cache_state);
+			recCacheKillAll(cache_state);
+			recConstKillAll(const_state);
+
+			a64::Label skip;
+			recEmitTrapCompareIfTrap(op, &skip);     // compare + B(skip) when NOT taken
+			recEmitWritePc(pc + 4);                  // trap() does pc-=4 -> EPC = trap pc
+			recEmitInterpInline(op);                 // trap taken: raise -> cpuRegs.pc = vector
+			recEmitCommitBlockCycles(raw_cycles);    // commit cycles incl. the trap
+			armEmitJmp(DispatcherEvent);             // event test + re-dispatch from cpuRegs.pc
+			armAsm->Bind(&skip);                     // NOT taken: fall through, stay in-block
+
+			waitloop_possible = false;               // a block with a trap is not a poll loop
+			pc += 4;
+			endpc = pc;
+			if (++compiled >= MAX_BLOCK_INSTS)
+			{
+				recEmitWritePc(pc);
+				known_dispatch_pc = true;
+				dispatch_pc = pc;
+				break;
+			}
+			continue;
 		}
 
 		if (recIsHandledBranch(op))
@@ -3863,6 +4285,63 @@ static void recRecompile(u32 startpc)
 			}
 			else if (g_pCurInstInfo->info & EEINST_COP2_SYNC_VU0)
 				raw_cycles = 0;
+		}
+
+		// MFC0/MTC0 of Count(rd9)/PERF(rd25): commit the block's cycles (incl. this op) so
+		// the read is live, clear the accumulator, then INLINE-interp in-block — instead of
+		// the expensive single-step path (these were ~80% of Jackie Chan's EE fallbacks, a
+		// Count busy-poll). Same commit-then-inline shape as the CALLMS launch above; the
+		// per-op commit makes consecutive Count reads see an advancing cpuRegs.cycle (no
+		// stale-value lock-up). See recCop0NeedsLiveCycle + the COP0 note in recTranslateOpOptimized.
+		if (recCop0NeedsLiveCycle(op))
+		{
+			raw_cycles += eeOpCycles(op);
+			recEmitCommitBlockCycles(raw_cycles);
+			raw_cycles = 0;
+			// Flush + kill the GPR register cache / const tracking before the inline interp,
+			// exactly like the trap path (recCacheFlushAll/KillAll/ConstKillAll above): MTC0
+			// reads cpuRegs.GPR.r[rt] from memory (must be authoritative) and MFC0 WRITES it —
+			// a stale cached copy in a callee-saved host reg would survive the C call and shadow
+			// the Count value, silently breaking the very poll loop this targets.
+			recCacheFlushAll(cache_state);
+			recCacheKillAll(cache_state);
+			recConstKillAll(const_state);
+			recEmitInterpInline(op);
+			waitloop_possible = false; // inline live-cycle op — not a wait-loop body
+			pc += 4;
+			endpc = pc;
+			if (++compiled >= MAX_BLOCK_INSTS)
+			{
+				recEmitWritePc(pc);
+				known_dispatch_pc = true;
+				dispatch_pc = pc;
+				break;
+			}
+			continue;
+		}
+
+		// COP0 EI / ERET (CO ops, rs==0x10; funct 0x38 / 0x18). Faithful to x86
+		// recEI/recERET (recBranchCall): run the interpreter handler in-block, then END
+		// the block so the tail event-tests + dispatches from cpuRegs.pc. EI: a now-
+		// unmasked pending IRQ gets serviced by that event test (x86 "must branch after
+		// enabling interrupts"); ERET: it writes cpuRegs.pc, so the dispatch must read it.
+		// Like the handled-branch path, the block's cycles ride in raw_cycles and the
+		// post-loop commits them (x86's iBranchTest also commits AFTER the Interp call) —
+		// no early commit, so no spurious tail +1. Replaces the per-op single-step (the
+		// top EE interpreter fallback after the BC0/MADD work).
+		if (recIsCop0EIorERET(op))
+		{
+			raw_cycles += eeOpCycles(op);
+			recCacheFlushAll(cache_state);
+			recCacheKillAll(cache_state);
+			recConstKillAll(const_state);
+			if (!recIsCop0ERET(op))
+				recEmitWritePc(pc + 4); // EI doesn't write PC; resume after it unless the event test diverts
+			recEmitInterpInline(op);    // Interp::EI sets Status.EIE / Interp::ERET sets cpuRegs.pc
+			waitloop_possible = false;
+			known_dispatch_pc = false;  // dispatch from cpuRegs.pc: an IRQ raised by the tail event test, or ERET's new pc
+			endpc = pc + 4;
+			break;
 		}
 
 		// Straight-line op we can codegen? (Generators decode from `op` directly;
@@ -3989,8 +4468,28 @@ static void recExecute()
 	}
 
 	eeRecExecuting = true;
+
+	// Cancel-instruction landing pad. An inline-interpreted op (recEmitInterpInline) that
+	// aborts the in-flight guest instruction — a vtlb TLB miss (vtlb.cpp), an address error
+	// (R5900OpcodeImpl RaiseAddressError), or a met MIPS trap raised by the native trap
+	// block's interpreter call — reaches Cpu->CancelInstruction() -> recCancelInstruction()
+	// -> longjmp(s_cancel_jmp_buf). We land here (NOT the s_jmp_buf exit path), then
+	// re-dispatch into the recompiled code from cpuRegs.pc, which cpuException already set to
+	// the exception vector. The faulting op never reached intUpdateCPUCycles, so charge a
+	// small fixed cycle (matching the old backend's +8) to guarantee forward progress and let
+	// any due event fire before re-entry. Then recEventTest() runs the shared event test
+	// AND honors a pending exit (VMState Stopping/Shutdown or eeRecExitRequested) by
+	// longjmp'ing to s_jmp_buf above, so Stop/Shutdown still unwinds. (Native traps that
+	// DON'T longjmp commit cycles + tail to DispatcherEvent themselves; this pad only
+	// catches the interp calls that abort via cpuException.) Mirrors trak's cancel pad.
+	if (setjmp(s_cancel_jmp_buf) != 0)
+	{
+		cpuRegs.cycle += 8;
+		recEventTest();
+	}
+
 	reinterpret_cast<void (*)()>(reinterpret_cast<uintptr_t>(EnterRecompiledCode))();
-	// EnterRecompiledCode never returns; the only way out is the fastjmp above.
+	// EnterRecompiledCode never returns; the only way out is one of the longjmps above.
 }
 
 static void recSafeExitExecution()
@@ -4004,7 +4503,14 @@ static void recSafeExitExecution()
 
 static void recCancelInstruction()
 {
-	pxFailRel("recCancelInstruction() called, this should never happen!");
+	// Raised when an inline-interpreted op aborts the in-flight guest instruction: a vtlb
+	// TLB miss (vtlb.cpp), an address error (R5900OpcodeImpl RaiseAddressError), or a met
+	// MIPS trap (trap() -> cpuException(0x34) -> Cpu->CancelInstruction()). cpuException has
+	// already rewritten cpuRegs.pc to the exception vector; we must NOT exit recExecute (that
+	// would stop the EE), only unwind the in-flight interp call and re-dispatch from the new
+	// PC. This matches the old arm64 backend and the interpreter's intCancelInstruction, both
+	// of which longjmp back into their loop.
+	longjmp(s_cancel_jmp_buf, 1);
 }
 
 static void recClear(u32 addr, u32 size)

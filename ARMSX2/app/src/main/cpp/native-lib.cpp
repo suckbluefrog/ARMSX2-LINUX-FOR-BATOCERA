@@ -16,6 +16,7 @@
 #include "common/FileSystem.h"
 #include "common/ZipHelpers.h"
 #include "pcsx2/GS.h"
+#include "pcsx2/Counters.h"
 #include "pcsx2/VMManager.h"
 #include "pcsx2/CDVD/CDVDcommon.h"
 #include "SIO/Memcard/MemoryCardFile.h"
@@ -50,6 +51,9 @@
 #include "native-lib.h"
 #include "libchdr/chd.h"
 #include <algorithm>
+#include <cmath>
+
+#include "common/HostSys.h"
 #include <cctype>
 #include <condition_variable>
 #include <deque>
@@ -139,6 +143,7 @@ static JNIEnv env_main;
 static JavaVM*    s_jvm              = nullptr;
 static jclass     s_NativeApp_class  = nullptr;  // GlobalRef
 static jmethodID  s_vmSetPaused_mid  = nullptr;
+static jmethodID  s_onPadRumble_mid  = nullptr;
 
 ////
 std::string GetJavaString(JNIEnv *env, jstring jstr) {
@@ -320,6 +325,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
         s_NativeApp_class = static_cast<jclass>(env->NewGlobalRef(local));
         env->DeleteLocalRef(local);
         s_vmSetPaused_mid = env->GetStaticMethodID(s_NativeApp_class, "vmSetPaused", "(Z)V");
+        s_onPadRumble_mid = env->GetStaticMethodID(s_NativeApp_class, "onPadRumble", "(III)V");
     }
 
     // Bind the JNI-backed HTTP downloader's class + method IDs while we
@@ -335,8 +341,20 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getGameTitle(JNIEnv *env, jclass clazz,
                                                   jstring p_szpath) {
     std::string _szPath = GetJavaString(env, p_szpath);
 
-    const GameList::Entry *entry;
-    entry = GameList::GetEntryForPath(_szPath.c_str());
+    // The Android library is scanned in Kotlin, so the NATIVE game-list cache is
+    // usually empty — GetEntryForPath misses and the info tab gets no CRC (the
+    // title/serial come from the Kotlin GameInfo, which is why those showed but
+    // CRC was blank). Fall back to an on-demand populate (reads the disc to
+    // compute serial + CRC). Callers invoke getGameTitle off the UI thread.
+    GameList::Entry temp_entry;
+    const GameList::Entry *entry = GameList::GetEntryForPath(_szPath.c_str());
+    if (!entry || entry->crc == 0)
+    {
+        if (GameList::PopulateEntryFromPath(_szPath, &temp_entry))
+            entry = &temp_entry;
+    }
+    if (!entry)
+        return env->NewStringUTF("");
 
     std::string ret;
     ret.append(entry->title);
@@ -618,9 +636,15 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setPadVibration(JNIEnv *env, jclass clazz,
 }
 
 
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_setPadButton(JNIEnv *env, jclass clazz,
-                                                  jint p_key, jint p_range, jboolean p_keyPressed) {
+// Serializes pad input (applyPadButton, on the Android input thread) against the
+// co-op hot-plug rebuild (enablePad2's Pad::LoadConfig, on a background thread),
+// which reassigns s_controllers[] (make_unique). ScopedVMPause only parks the
+// CPU/MTGS/MTVU threads, NOT the input thread, so without this a P2-join could
+// use-after-free the controller being replaced. Uncontended on the input thread
+// (all input is serial on the UI thread) except for the brief enablePad2 window.
+static std::mutex s_pad_mutex;
+
+static void applyPadButton(u32 port, jint p_key, jint p_range, jboolean p_keyPressed) {
     PadDualshock2::Inputs _key;
     switch (p_key) {
         case 19: _key = PadDualshock2::Inputs::PAD_UP; break;
@@ -647,6 +671,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setPadButton(JNIEnv *env, jclass clazz,
         case 121: _key = PadDualshock2::Inputs::PAD_R_RIGHT; break;
         case 122: _key = PadDualshock2::Inputs::PAD_R_DOWN; break;
         case 123: _key = PadDualshock2::Inputs::PAD_R_LEFT; break;
+        // Custom target (ControllerMappings "analog" action) — the DualShock2
+        // Analog/mode button. Toggles analog mode; some early games (e.g. Driving
+        // Emotion Type-S) need it pressed before the sticks work at all. The
+        // native PAD already handles the toggle (shows "Analog light is now ...").
+        case 200: _key = PadDualshock2::Inputs::PAD_ANALOG; break;
         default: _key = PadDualshock2::Inputs::PAD_CROSS ; break;
     }
 
@@ -655,7 +684,23 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setPadButton(JNIEnv *env, jclass clazz,
     const float state = p_keyPressed
         ? ((p_range > 0) ? (p_range / 32767.0f) : 1.0f)
         : 0.0f;
-    Pad::SetControllerState(0, static_cast<u32>(_key), state);
+    std::lock_guard<std::mutex> lk(s_pad_mutex);
+    Pad::SetControllerState(port, static_cast<u32>(_key), state);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setPadButton(JNIEnv *env, jclass clazz,
+                                                  jint p_key, jint p_range, jboolean p_keyPressed) {
+    applyPadButton(0, p_key, p_range, p_keyPressed);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setPadButtonForPort(JNIEnv *env, jclass clazz,
+                                                         jint p_port, jint p_key, jint p_range,
+                                                         jboolean p_keyPressed) {
+    // Local co-op: route to PS2 controller port 0 (P1) or 1 (P2). SetControllerState
+    // ignores ports >= NUM_CONTROLLER_PORTS; a negative/unset port falls back to P1.
+    applyPadButton(p_port < 0 ? 0u : static_cast<u32>(p_port), p_key, p_range, p_keyPressed);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -711,6 +756,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_speedhackLimitermode(JNIEnv *env, jclass cl
     if (mode == LimiterModeType::Slomo && Achievements::IsHardcoreModeActive())
         mode = LimiterModeType::Nominal;
     VMManager::SetLimiterMode(mode);
+    // Suspend the Android present-FPS cap while fast-forwarding (Turbo) so the
+    // speed-up is visible instead of being held at the cap. Unlimited (the
+    // frame-limit-off steady state) keeps the cap — there the user still wants a
+    // bounded DISPLAY rate over uncapped emulation. Re-engages on Nominal.
+    GSSetPresentCapSuspended(mode == LimiterModeType::Turbo);
 }
 
 extern "C"
@@ -779,11 +829,31 @@ extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_setFpsCap(JNIEnv *env, jclass clazz,
                                                jint p_fps) {
-    // Deprecated. The previous Android-only FPS cap skipped GS rendering, which
-    // broke BIOS/game visuals in titles which depend on every GS update. Keep
-    // the JNI symbol so older settings/UI calls are harmless, but route users
-    // through PCSX2's normal frame limiter / NominalScalar pacing instead.
-    Console.WriteLnFmt("@@ANDROID_FPSCAP@@ ignored={}", p_fps);
+    // Max presented-FPS cap. INDEPENDENT of the Speed Limit % — it caps the
+    // DISPLAY frame rate by dropping presents on the GS thread (GSRenderer::VSync)
+    // while emulation keeps running full speed. It never touches NominalScalar,
+    // so it does not slow the game and does not fight the Speed Limit %. The cap
+    // is adaptive (drops only when ahead of the target interval), so a game
+    // already at/below the target is unaffected — no over-skip. 0 = off.
+    //
+    // No RetroAchievements guard needed: capping the present rate is not a
+    // slowdown (game logic still advances in real time), so hardcore is fine.
+    const u32 fps = (p_fps > 0) ? static_cast<u32>(std::min(p_fps, 1000)) : 0u;
+    u64 interval = 0;
+    if (fps > 0)
+    {
+        // Arbitrary present-rate cap: present at most once per (1/fps) seconds. The
+        // GS-thread accumulator pacer (GSRenderer::VSync) holds this average rate
+        // for ANY target (e.g. 47/55 for per-game golden-spot tuning), not just
+        // whole divisions of the source. Capping at/above the game's own rate
+        // can't drop frames (the source produces no more), so treat that as off.
+        const double native = static_cast<double>(VMManager::GetFrameRate()); // ~59.94 / 50
+        if (static_cast<double>(fps) < native - 0.5)
+            interval = static_cast<u64>(static_cast<double>(GetTickFrequency()) / static_cast<double>(fps));
+        // else interval stays 0 → off (no effective cap)
+    }
+    GSSetMaxPresentFps(fps, interval);
+    Console.WriteLnFmt("@@ANDROID_FPSCAP@@ fps={} interval_ticks={}", fps, interval);
 }
 
 extern "C"
@@ -862,11 +932,25 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setInstantVU1(JNIEnv*, jclass, jboolean ena
 // fails to park, parked() stays false and the caller must skip the state op.
 class ScopedVMPause {
 public:
-    ScopedVMPause() {
+    // pause_audio=false keeps the SPU2 output device running across the park.
+    // Used by the settings-apply paths (commitSettings / live GS): a heavy
+    // gamefix can park the VM for seconds, and pausing the low-latency Android
+    // audio stream that long let the OS reclaim it — audio then stayed muted
+    // until a manual menu resume. The CPU/MTGS/MTVU threads are still parked
+    // for the JIT/GS rebuild; only the audio pause edges are suppressed, and
+    // the stream emits silence on underrun so there's no audible artifact.
+    explicit ScopedVMPause(bool pause_audio = true) {
         m_was_running = (VMManager::GetState() == VMState::Running);
         m_was_paused = (VMManager::GetState() == VMState::Paused);
         if (m_was_running)
         {
+            // Set BEFORE SetPaused(true) so the pause edge is suppressed; the
+            // dtor clears it AFTER SetPaused(false) so the resume edge is too.
+            if (!pause_audio)
+            {
+                m_audio_pause_suppressed = true;
+                SPU2::SetOutputPauseSuppressed(true);
+            }
             VMManager::SetPaused(true);
             if (!s_execute_exit.load(std::memory_order_acquire) && Cpu)
                 Cpu->ExitExecution();
@@ -880,6 +964,8 @@ public:
     ~ScopedVMPause() {
         if (m_was_running && !s_stop_requested.load(std::memory_order_acquire))
             VMManager::SetPaused(false);
+        if (m_audio_pause_suppressed)
+            SPU2::SetOutputPauseSuppressed(false);
     }
     ScopedVMPause(const ScopedVMPause&) = delete;
     ScopedVMPause& operator=(const ScopedVMPause&) = delete;
@@ -890,6 +976,7 @@ private:
     bool m_was_running = false;
     bool m_was_paused = false;
     bool m_parked = false;
+    bool m_audio_pause_suppressed = false;
 };
 
 static void LogAndroidGSSettings(const char* reason)
@@ -927,7 +1014,9 @@ static bool ApplyLiveGSSettingsIfOpen(const char* reason)
 {
     if (MTGS::IsOpen())
     {
-        ScopedVMPause vm_pause;
+        // pause_audio=false: keep the audio device alive across the park so a
+        // live GS reconfigure can't mute audio (see ScopedVMPause).
+        ScopedVMPause vm_pause(/*pause_audio=*/false);
         if (!vm_pause.parked())
         {
             Console.WriteLnFmt("@@ANDROID_GS_SETTINGS@@ reason={} skipped=cpu_not_parked", reason);
@@ -1003,7 +1092,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_commitSettings(JNIEnv *env, jclass clazz) {
         // cost when the VM is already parked. Skipped entirely pre-VM:
         // s_execute_exit is false before the first Execute(), so the guard
         // would spin its full 3s watchdog during setup-wizard commits.
-        ScopedVMPause vm_pause;
+        // pause_audio=false: a heavy gamefix can park the VM for seconds;
+        // pausing the audio device that long lets Android reclaim it and the
+        // game goes silent until a manual menu resume. Keep it running (it
+        // fills with silence on underrun) while the JIT/GS caches rebuild.
+        ScopedVMPause vm_pause(/*pause_audio=*/false);
         VMManager::ApplySettings();
         if (MTGS::IsOpen())
             MTGS::ApplySettings();
@@ -1055,6 +1148,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_applyGSSettingsLive(JNIEnv *env, jclass cla
     const auto saved_blit_swap       = EmuConfig.GS.UseBlitSwapChain;
     const auto saved_no_shader_cache = EmuConfig.GS.DisableShaderCache;
     const auto saved_no_fb_fetch     = EmuConfig.GS.DisableFramebufferFetch;
+    const auto saved_adreno_fbfetch  = EmuConfig.GS.EnableAdrenoFramebufferFetch;
     const auto saved_no_vs_expand    = EmuConfig.GS.DisableVertexShaderExpand;
     const auto saved_tex_barriers    = EmuConfig.GS.OverrideTextureBarriers;
     const auto saved_depth_feedback  = EmuConfig.GS.DepthFeedbackMode;
@@ -1080,6 +1174,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_applyGSSettingsLive(JNIEnv *env, jclass cla
     EmuConfig.GS.UseBlitSwapChain           = saved_blit_swap;
     EmuConfig.GS.DisableShaderCache         = saved_no_shader_cache;
     EmuConfig.GS.DisableFramebufferFetch    = saved_no_fb_fetch;
+    EmuConfig.GS.EnableAdrenoFramebufferFetch = saved_adreno_fbfetch;
     EmuConfig.GS.DisableVertexShaderExpand  = saved_no_vs_expand;
     EmuConfig.GS.OverrideTextureBarriers    = saved_tex_barriers;
     EmuConfig.GS.DepthFeedbackMode          = saved_depth_feedback;
@@ -1123,6 +1218,75 @@ Java_kr_co_iefriends_pcsx2_NativeApp_reloadPatches(JNIEnv *env, jclass clazz) {
     const u32 active_cheats = Patch::GetActiveCheatsCount();
     Console.WriteLnFmt("@@ANDROID_PNACH@@ reload active_cheats={}", active_cheats);
     return static_cast<jint>(active_cheats);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_applyFramerateLive(JNIEnv *env, jclass clazz,
+                                                        jfloat p_ntsc, jfloat p_pal) {
+    // Per-region NTSC/PAL emulated vsync rate, applied LIVE (no restart) so the
+    // Frame Rate sliders behave like NetherSX2. The pacer caches the rate in
+    // vSyncInfo, so a plain EmuConfig write does nothing until UpdateVSyncRate
+    // recomputes it — mirroring VMManager::CheckForGSConfigChanges' framerate
+    // branch (UpdateVSyncRate + UpdateTargetSpeed).
+    //
+    // CRITICAL: UpdateVSyncRate rewrites the EE-thread hsync/vsync counters and
+    // calls cpuRcntSet(), so it MUST run with the CPU/MTGS/MTVU threads parked —
+    // a raw JNI-thread call would race the emulation loop. ScopedVMPause(false)
+    // parks them but keeps the audio stream alive (avoids the low-latency-stream
+    // reclaim that muted audio on longer parks). Invoked off the UI thread via
+    // LiveGsApplyQueue, which also coalesces rapid slider drags.
+    if (!VMManager::HasValidVM())
+        return;
+    ScopedVMPause vm_pause(false);
+    if (!vm_pause.parked())
+        return;
+    EmuConfig.GS.FramerateNTSC = static_cast<float>(p_ntsc);
+    EmuConfig.GS.FrameratePAL = static_cast<float>(p_pal);
+    UpdateVSyncRate(true);
+    VMManager::UpdateTargetSpeed();
+    Console.WriteLnFmt("@@ANDROID_FRAMERATE@@ ntsc={} pal={}",
+        EmuConfig.GS.FramerateNTSC, EmuConfig.GS.FrameratePAL);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_enablePad2(JNIEnv *env, jclass clazz) {
+    // Local co-op: hot-plug a second DualShock2 into PS2 port 2 the moment a 2nd
+    // physical controller joins (PadRouter). By default GetDefaultPadType makes only
+    // port 0 a DualShock2, so until this runs SetControllerState(1,...) lands on the
+    // (valid, non-null) PadNotConnected slot 1 — a safe no-op. Persist [Pad2] to the
+    // base layer so a later ApplySettings keeps it, set the live EmuConfig, then
+    // Pad::LoadConfig rebuilds the pads (with eject ticks so the running game detects
+    // the insertion).
+    //
+    // Threading: Pad::LoadConfig reassigns s_controllers[] (make_unique) and is read
+    // by BOTH the EE/SIO (CPU) thread AND the Android input thread. ScopedVMPause
+    // parks the CPU/MTGS/MTVU side; s_pad_mutex serializes the input side (applyPadButton).
+    // Both are required to avoid a use-after-free on the replaced controller. Runs on a
+    // background thread (see Main.onPlayer2Joined) so the input thread isn't blocked by
+    // the up-to-3s park wait.
+    if (!VMManager::HasValidVM())
+        return;
+    if (EmuConfig.Pad.Ports[1].Type == Pad::ControllerType::DualShock2)
+        return; // already connected
+    ScopedVMPause vm_pause(false);
+    if (!vm_pause.parked())
+        return;
+    {
+        auto lock = Host::GetSettingsLock();
+        if (SettingsInterface* si = Host::GetSettingsInterface()) {
+            si->SetStringValue("Pad2", "Type", "DualShock2");
+            si->SetFloatValue("Pad2", "Deadzone", 0.0f);        // app shapes the stick (shapeStickMag)
+            si->SetFloatValue("Pad2", "AxisScale", 1.33f);      // PCSX2 default
+            si->SetFloatValue("Pad2", "ButtonDeadzone", 0.0f);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(s_pad_mutex);
+        EmuConfig.Pad.Ports[1].Type = Pad::ControllerType::DualShock2;
+        Pad::LoadConfig(*Host::GetSettingsInterface());
+    }
+    Console.WriteLn("@@ANDROID_COOP@@ Pad2 enabled (DualShock2)");
 }
 
 // jobjectArray<String> -> std::vector<std::string>.
@@ -1524,6 +1688,46 @@ int FileSystem::OpenFDFileContent(const char* filename)
     return fd;
 }
 
+bool FileSystem::CreateDirectoryViaJava(const char* path)
+{
+    // Bridges to NativeApp.createDirectoryPath (java.io.File.mkdirs). Used as a
+    // fallback when libc mkdir() is denied on FUSE-emulated external storage,
+    // which is what makes folder memory cards work on a custom data folder.
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    if (env == nullptr)
+        return false;
+    jclass NativeApp = env->FindClass("kr/co/iefriends/pcsx2/NativeApp");
+    if (NativeApp == nullptr)
+    {
+        env->ExceptionClear();
+        return false;
+    }
+    jmethodID mid = env->GetStaticMethodID(NativeApp, "createDirectoryPath", "(Ljava/lang/String;)Z");
+    if (mid == nullptr)
+    {
+        env->ExceptionClear();
+        env->DeleteLocalRef(NativeApp);
+        return false;
+    }
+    // Called many times during folder-card use, so free every local ref and clear
+    // any pending JNI exception on all paths — the Java side swallows its own, but
+    // a JNI-layer throw must not leak a local ref or an exception onto the next call.
+    bool ok = false;
+    jstring j_path = env->NewStringUTF(path);
+    if (j_path != nullptr)
+    {
+        ok = (env->CallStaticBooleanMethod(NativeApp, mid, j_path) == JNI_TRUE);
+        if (env->ExceptionCheck())
+        {
+            env->ExceptionClear();
+            ok = false;
+        }
+        env->DeleteLocalRef(j_path);
+    }
+    env->DeleteLocalRef(NativeApp);
+    return ok;
+}
+
 void ReportTestResults(const char* label, int passed, int total)
 {
     auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
@@ -1608,6 +1812,10 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
             "EmuCore/GS", "FrameLimitEnable", true);
         VMManager::SetLimiterMode(frame_limit_on ? LimiterModeType::Nominal
                                                  : LimiterModeType::Unlimited);
+        // The present-cap-suspend flag is process-global (it lives in GS.cpp), so a
+        // game stopped mid-fast-forward could leave it set. Clear it on every boot
+        // so a fresh game never starts with its display cap silently bypassed.
+        GSSetPresentCapSuspended(false);
         VMState _vmState = VMState::Running;
         VMManager::SetState(_vmState);
         ////
@@ -2385,6 +2593,12 @@ Java_kr_co_iefriends_pcsx2_NativeApp_osdShowFrameTimes(JNIEnv*, jclass, jboolean
     applyOsdSetting();
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_osdShowHardwareInfo(JNIEnv*, jclass, jboolean enabled) {
+    EmuConfig.GS.OsdShowHardwareInfo = enabled;
+    applyOsdSetting();
+}
+
 // Master OSD toggle — flips every OSD bit we enable at first init in
 // initialize() so the in-game overlay's OSD pill is a single switch.
 // Writes BASE too so the state survives the next ApplySettings reload
@@ -2420,6 +2634,71 @@ Java_kr_co_iefriends_pcsx2_NativeApp_osdShowAll(JNIEnv*, jclass, jboolean enable
         s_settings_interface->Save();
 
     applyOsdSetting();
+}
+
+// ---- Per-game settings export (upstream-style sparse game INI) ----
+// Mirrors PCSX2's FullscreenUI game-settings save (FullscreenUI.cpp): the
+// Kotlin side streams only the keys that differ from global into a fresh
+// INISettingsInterface at gamesettings/<serial>_<CRC>.ini, then commit drops
+// empty sections and deletes the file when there are no overrides — so the
+// on-disk artifact is sparse and portable, exactly like the desktop UI writes.
+// The running game already reflects the change live (Kotlin's applySafeLiveDelta /
+// ConfigStore), so we deliberately do NOT ReloadGameSettings here: that calls
+// ApplySettings (a VM park) and would reintroduce the per-tap hitch the live
+// delta path exists to avoid. The INI is picked up as the game layer on the
+// next boot via UpdateGameSettingsLayer.
+static std::unique_ptr<INISettingsInterface> s_export_game_ini;
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_gameIniBeginWrite(JNIEnv*, jclass) {
+    if (!VMManager::HasValidVM())
+        return JNI_FALSE;
+    const u32 crc = VMManager::GetDiscCRC();
+    if (crc == 0)
+        return JNI_FALSE;
+    // Fresh interface (no Load) so the export is a clean regeneration of the
+    // current overrides — stale keys from a previous save never linger.
+    s_export_game_ini = std::make_unique<INISettingsInterface>(
+        VMManager::GetGameSettingsPath(VMManager::GetDiscSerial(), crc));
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_gameIniPut(JNIEnv* env, jclass,
+                                                jstring p_section, jstring p_key, jstring p_value) {
+    if (!s_export_game_ini)
+        return;
+    const char* section = env->GetStringUTFChars(p_section, nullptr);
+    const char* key = env->GetStringUTFChars(p_key, nullptr);
+    const char* value = env->GetStringUTFChars(p_value, nullptr);
+    // CSimpleIni is untyped string storage; the typed getters (GetBoolValue etc.)
+    // parse the string back, so writing the Kotlin string repr round-trips.
+    if (section && key && value)
+        s_export_game_ini->SetStringValue(section, key, value);
+    if (value) env->ReleaseStringUTFChars(p_value, value);
+    if (key) env->ReleaseStringUTFChars(p_key, key);
+    if (section) env->ReleaseStringUTFChars(p_section, section);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_gameIniCommitWrite(JNIEnv*, jclass) {
+    if (!s_export_game_ini)
+        return JNI_FALSE;
+    Error error;
+    bool ok = true;
+    s_export_game_ini->RemoveEmptySections();
+    if (s_export_game_ini->IsEmpty()) {
+        // No per-game overrides — remove the file entirely (FullscreenUI parity).
+        const std::string fn = s_export_game_ini->GetFileName();
+        if (FileSystem::FileExists(fn.c_str()))
+            ok = FileSystem::DeleteFilePath(fn.c_str(), &error);
+    } else {
+        ok = s_export_game_ini->Save(&error);
+    }
+    s_export_game_ini.reset();
+    if (!ok)
+        Console.ErrorFmt("@@ANDROID_GAMEINI@@ commit failed: {}", error.GetDescription());
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2833,6 +3112,22 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getCompatibilityForSerial(JNIEnv* env, jcla
     return static_cast<jint>(db_entry->compat);
 }
 
+// The GameDB's curated region string for a serial (e.g. "NTSC-U", "PAL-E", "PAL-IN",
+// "NTSC-C", "NTSC-K", "NTSC-HK"), or "" if not in the database. Lets the library show
+// the TRUE region (India, China, Korea, Hong Kong…) that a serial PREFIX can't tell
+// apart — e.g. SCES-55670 "Don 2" is PAL-IN (India), not generic PAL/Europe.
+extern "C" JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getRegionForSerial(JNIEnv* env, jclass, jstring jSerial)
+{
+    if (!jSerial) return env->NewStringUTF("");
+    const std::string serial = GetJavaString(env, jSerial);
+    if (serial.empty()) return env->NewStringUTF("");
+
+    const GameDatabaseSchema::GameEntry* db_entry = GameDatabase::findGame(serial);
+    if (!db_entry) return env->NewStringUTF("");
+    return env->NewStringUTF(db_entry->region.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // BIOS info probe — invoked from the setup wizard while the user is picking
 // a BIOS directory. Takes ownership of `fd` (the caller MUST have detached
@@ -2890,6 +3185,26 @@ void Native::vmSetPaused(bool paused) {
     }
 
     env->CallStaticVoidMethod(s_NativeApp_class, s_vmSetPaused_mid, static_cast<jboolean>(paused));
+
+    if (attached) s_jvm->DetachCurrentThread();
+}
+
+void Native::onPadRumble(int pad, int largeMotor, int smallMotor) {
+    if (!s_jvm || !s_NativeApp_class || !s_onPadRumble_mid) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    const int status = s_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if (s_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        attached = true;
+    } else if (status != JNI_OK) {
+        return;
+    }
+
+    env->CallStaticVoidMethod(s_NativeApp_class, s_onPadRumble_mid,
+                              static_cast<jint>(pad), static_cast<jint>(largeMotor),
+                              static_cast<jint>(smallMotor));
 
     if (attached) s_jvm->DetachCurrentThread();
 }

@@ -29,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -167,6 +168,9 @@ private fun manualPnachContents(title: String, body: String, gameId: PnachGameId
 @Composable
 fun PatchesTab(state: MutableState<Settings>) {
     val s = state.value
+    // RetroAchievements hardcore forbids cheats (the core also refuses to apply
+    // them — see Patch.cpp). Recomposes when the achievements poll flips it.
+    val hardcore by InGameOverlay.hardcoreOn
     val context = LocalContext.current
     val scroll = remember { ScrollState(0) }
     ControllerAutoScroll(scroll)
@@ -201,6 +205,10 @@ fun PatchesTab(state: MutableState<Settings>) {
 
     fun apply(updated: Settings) = InGameOverlay.saveSettings(updated)
     fun activateCheatsAndReload(): Int {
+        if (hardcore) {
+            pnachStatus = "Cheats are disabled while RetroAchievements Hardcore mode is active."
+            return 0
+        }
         if (!state.value.enableCheats)
             apply(state.value.copy(enableCheats = true))
 
@@ -284,7 +292,8 @@ fun PatchesTab(state: MutableState<Settings>) {
             ?.ifBlank { null } ?: "patch"
         var anyCheatChosen = false
         val saved = runCatching {
-            listOf("patches", "cheats").forEach { source ->
+            val sources = if (hardcore) listOf("patches") else listOf("patches", "cheats")
+            sources.forEach { source ->
                 val picked = chosen.filter { it.source == source }
                 val dir = if (source == "cheats") cheatsDir else patchesDir
                 val file = File(dir, "$base.pnach")
@@ -429,14 +438,16 @@ fun PatchesTab(state: MutableState<Settings>) {
                         TextButton(onClick = { selected.clear() }) { Text("None") }
                     }
                     res.entries.forEachIndexed { i, e ->
+                        val locked = hardcore && e.source == "cheats"
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { selected[i] = !(selected[i] ?: false) }
+                                .alpha(if (locked) 0.4f else 1f)
+                                .clickable(enabled = !locked) { selected[i] = !(selected[i] ?: false) }
                                 .padding(vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Checkbox(checked = selected[i] == true, onCheckedChange = { selected[i] = it })
+                            Checkbox(checked = selected[i] == true, enabled = !locked, onCheckedChange = { if (!locked) selected[i] = it })
                             Column(modifier = Modifier.weight(1f).padding(start = 4.dp)) {
                                 Text(e.name, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
                                 Text(
@@ -477,7 +488,23 @@ fun PatchesTab(state: MutableState<Settings>) {
             apply(s.copy(enableNoInterlacingPatches = it))
         }
         SettingsDivider()
-        ToggleRow("Cheats (PNACH)", s.enableCheats) { apply(s.copy(enableCheats = it)) }
+        if (hardcore) {
+            Box(Modifier.fillMaxWidth().alpha(0.4f)) {
+                ToggleRow("Cheats (PNACH) — disabled in Hardcore", false) { /* locked */ }
+            }
+        } else {
+            ToggleRow("Cheats (PNACH)", s.enableCheats) { apply(s.copy(enableCheats = it)) }
+        }
+        SettingsDivider()
+        ToggleRow("HostFS (host: filesystem)", s.hostFs) { apply(s.copy(hostFs = it)) }
+        Text(
+            "Lets the game read files from the host: namespace — needed for some ELF / homebrew " +
+                "and game mods (e.g. modded Persona 3 FES, paired with a per-game ELF/disc path). " +
+                "Applies on the next game boot. Leave OFF for normal play.",
+            color = Color(0xFFB0B0B0),
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 2.dp, bottom = 8.dp),
+        )
         SettingsDivider()
 
         // ---- PNACH importer ----
@@ -499,7 +526,8 @@ fun PatchesTab(state: MutableState<Settings>) {
             modifier = Modifier.padding(bottom = 4.dp),
         )
         Text(
-            "Paste/import PCSX2 PNACH patch= lines. Hardcore achievements disables cheats.",
+            if (hardcore) "Cheats are disabled while RetroAchievements Hardcore mode is active. Patches still apply."
+            else "Paste/import PCSX2 PNACH patch= lines. Hardcore achievements disables cheats.",
             color = Color(0xFF8C8C8C),
             fontSize = 10.sp,
             modifier = Modifier.padding(bottom = 4.dp),
@@ -535,12 +563,13 @@ fun PatchesTab(state: MutableState<Settings>) {
                 Modifier
                     .weight(1f)
                     .height(36.dp)
+                    .alpha(if (hardcore) 0.4f else 1f)
                     .background(rowAura())
                     .controllerFocusable(
                         controllerId = "patch:import",
-                        onConfirm = { importLauncher.launch(arrayOf("*/*")) },
+                        onConfirm = { if (!hardcore) importLauncher.launch(arrayOf("*/*")) },
                     )
-                    .clickable { importLauncher.launch(arrayOf("*/*")) }
+                    .clickable(enabled = !hardcore) { importLauncher.launch(arrayOf("*/*")) }
                     .padding(horizontal = 8.dp),
                 contentAlignment = Alignment.CenterStart,
             ) {
@@ -550,12 +579,13 @@ fun PatchesTab(state: MutableState<Settings>) {
                 Modifier
                     .weight(1f)
                     .height(36.dp)
+                    .alpha(if (hardcore) 0.4f else 1f)
                     .background(rowAura())
                     .controllerFocusable(
                         controllerId = "patch:enter",
-                        onConfirm = { showManualDialog = true },
+                        onConfirm = { if (!hardcore) showManualDialog = true },
                     )
-                    .clickable { showManualDialog = true }
+                    .clickable(enabled = !hardcore) { showManualDialog = true }
                     .padding(horizontal = 8.dp),
                 contentAlignment = Alignment.CenterStart,
             ) {

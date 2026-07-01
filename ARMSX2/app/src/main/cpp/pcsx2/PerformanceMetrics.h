@@ -36,6 +36,7 @@ namespace PerformanceMetrics
 	bool IsInternalFPSValid();
 
 	float GetFPS();
+	float GetPresentFPS();
 	float GetInternalFPS();
 	float GetSpeed();
 	float GetAverageFrameTime();

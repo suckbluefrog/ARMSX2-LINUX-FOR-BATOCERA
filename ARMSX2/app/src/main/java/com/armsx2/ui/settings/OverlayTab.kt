@@ -15,6 +15,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.armsx2.config.Settings
 import com.armsx2.ui.InGameOverlay
+import com.armsx2.ui.UiScale
 
 /**
  * Performance Overlay element toggles. Lets the user show/hide individual
@@ -65,5 +66,40 @@ fun OverlayTab(state: MutableState<Settings>) {
         ToggleRow("GS statistics", s.osdShowGsStats) { apply(s.copy(osdShowGsStats = it)) }
         SettingsDivider()
         ToggleRow("Frame times graph", s.osdShowFrameTimes) { apply(s.copy(osdShowFrameTimes = it)) }
+        SettingsDivider()
+        ToggleRow("Hardware info (CPU/GPU model)", s.osdShowHardwareInfo) { apply(s.copy(osdShowHardwareInfo = it)) }
+        SettingsDivider()
+        ToggleRow("Emulator version", s.osdShowVersion) { apply(s.copy(osdShowVersion = it)) }
+        SettingsDivider()
+
+        // Interface scaling (global, not per-game): resize the library / menu chrome
+        // and text for different screen aspect ratios / handheld sizes. Does NOT
+        // touch the game image or the on-screen touch controls.
+        Text(
+            "Interface scaling — resize the library and menu UI to fit your screen. " +
+                "Does not affect the game image or on-screen touch controls.",
+            color = Color(0xFFB0B0B0),
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 10.dp, bottom = 6.dp),
+        )
+        IntSliderRow(
+            label = "UI Size (borders)",
+            value = (UiScale.borderScale.value * 100f).toInt(),
+            min = (UiScale.MIN * 100f).toInt(),
+            max = (UiScale.BORDER_MAX * 100f).toInt(),
+            description = "Scales menu/library padding and control sizes. 100% = default.",
+            valueFormatter = { "$it%" },
+            onChange = { UiScale.setBorderScale(it / 100f) },
+        )
+        SettingsDivider()
+        IntSliderRow(
+            label = "UI Font Size",
+            value = (UiScale.fontScale.value * 100f).toInt(),
+            min = (UiScale.MIN * 100f).toInt(),
+            max = (UiScale.MAX * 100f).toInt(),
+            description = "Scales menu/library text. 100% = default.",
+            valueFormatter = { "$it%" },
+            onChange = { UiScale.setFontScale(it / 100f) },
+        )
     }
 }

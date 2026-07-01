@@ -3,11 +3,16 @@ package kr.co.iefriends.pcsx2;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.ParcelFileDescriptor;
 import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.system.Os;
 import android.system.OsConstants;
+import android.view.InputDevice;
 import android.view.Surface;
 
 import com.armsx2.BiosInfo;
@@ -64,21 +69,26 @@ public class NativeApp {
 			externalFilesDir = context.getDataDir();
 		}
 
-		// DataRoot: prefer the user-chosen system folder (SAF tree URI in
-		// the `systemDir` pref, resolved to POSIX by Main.systemDirPosix).
-		// Falls back to externalFilesDir when unset / unresolvable.
+		// DataRoot: prefer the user-chosen system folder only when the SAF tree
+		// URI resolves to a POSIX path that native code can actually write.
+		// Falls back to externalFilesDir when unset, unresolvable, or blocked
+		// by scoped storage.
 		String chosen = Main.Companion.systemDirPosix();
+		if (chosen != null && !Main.Companion.validateSystemDirWritable(chosen)) {
+			chosen = null;
+		}
 		String dataPath = (chosen != null) ? chosen : externalFilesDir.getAbsolutePath();
 
-		// BIOS folder: the directory that actually holds the configured BIOS
-		// file. The setup wizard (and the data-root migration in
-		// Main.kickoffEmucoreInit) place the BIOS under <dataRoot>/bios, so
-		// pointing EmuFolders::Bios at the file's own parent makes BIOS loading
-		// follow a custom system folder instead of being pinned to app-private.
-		// Falls back to <dataPath>/bios, then the app-private bios dir.
+		// BIOS folder: the directory that actually holds the configured BIOS file.
+		// The setup wizard (and the migration in Main.kickoffEmucoreInit) keep the
+		// BIOS in app-private internal storage — NOT under a custom/SD data root —
+		// because the native FileSystem APIs can't reliably open a BIOS off a
+		// removable/SAF volume on Android 11+ (that made a data-root-on-SD game fail
+		// VM init and bounce back to the library). Falls back to externalFilesDir/bios
+		// (always app-owned + readable), matching that decoupled-BIOS design.
 		String biosFolder = Main.Companion.biosFolderPosix();
 		if (biosFolder == null || biosFolder.isEmpty()) {
-			biosFolder = dataPath + java.io.File.separator + "bios";
+			biosFolder = externalFilesDir.getAbsolutePath() + java.io.File.separator + "bios";
 		}
 
 		initialize(dataPath, biosFolder, android.os.Build.VERSION.SDK_INT);
@@ -217,6 +227,16 @@ public class NativeApp {
 	public static native void osdShowResolution(boolean enabled);
 	public static native void osdShowGSStats(boolean enabled);
 	public static native void osdShowFrameTimes(boolean enabled);
+	public static native void osdShowHardwareInfo(boolean enabled);
+	public static native void osdShowVersion(boolean enabled);
+
+	/** Per-game settings export — writes only the keys that differ from global
+	 *  into gamesettings/<serial>_<CRC>.ini for the running game (sparse, like
+	 *  PCSX2's desktop UI). Stream: gameIniBeginWrite() once, gameIniPut() per
+	 *  override key, gameIniCommitWrite() to save (or delete when empty). */
+	public static native boolean gameIniBeginWrite();
+	public static native void gameIniPut(String section, String key, String value);
+	public static native boolean gameIniCommitWrite();
 
 	/** Pin a custom Vulkan driver (e.g. Mesa Turnip) for the next VM
 	 *  start. Must be called BEFORE Main.start() — the first MTGS::Open
@@ -234,7 +254,192 @@ public class NativeApp {
 
 	public static native void setPadVibration(boolean isonoff);
 	public static native void setPadButton(int index, int range, boolean iskeypressed);
+	/** Local co-op: like setPadButton but routes to PS2 controller port 0 (Player 1)
+	 *  or 1 (Player 2). The plain setPadButton above stays port-0 for touch controls. */
+	public static native void setPadButtonForPort(int port, int index, int range, boolean iskeypressed);
+	/** Local co-op: hot-plug a 2nd DualShock2 into PS2 port 2 when a second physical
+	 *  controller joins. Idempotent; briefly parks the VM to rebuild the pad list. */
+	public static native void enablePad2();
 	public static native void resetKeyStatus();
+
+	// ---- Controller rumble (BT/USB gamepads via Android InputDevice) ----
+	// Device id of the most-recently-used gamepad, set from Main.dispatchKeyEvent.
+	public static volatile int sRumbleDeviceId = -1;
+	// Master enable (default on).
+	public static volatile boolean sRumbleEnabled = true;
+	// One-shot length; re-issued when the game changes intensity, cancelled on
+	// zero. Long enough to cover sustained rumble between intensity changes.
+	private static final int RUMBLE_MS = 3000;
+
+	/** Called from native (IOP thread) when PS2 pad motor intensity changes for
+	 *  [pad] (unified slot: 0 = Player 1, 1 = Player 2). largeMotor/smallMotor are
+	 *  0..255. Local co-op: routes the rumble to THAT player's controller. Falls
+	 *  back to the last-used gamepad when the port isn't claimed yet (single-player,
+	 *  or before first input) — solo play is unchanged. No-op with no vibrator. */
+	public static void onPadRumble(int pad, int largeMotor, int smallMotor) {
+		if (!sRumbleEnabled) return;
+		int devId = com.armsx2.input.PadRouter.INSTANCE.deviceIdForPort(pad);
+		if (devId < 0) devId = sRumbleDeviceId;
+		// devId may stay -1 for touch-only Player 1 (no gamepad); vibrateDevice still
+		// drives the device's own haptic for P1 (issue #241). P2 with no pad has no target.
+		if (devId < 0 && pad != 0) return;
+		float low = Math.max(0f, Math.min(1f, largeMotor / 255f));   // low-frequency / large
+		float high = Math.max(0f, Math.min(1f, smallMotor / 255f));  // high-frequency / small
+		vibrateDevice(devId, low, high, RUMBLE_MS, pad == 0);
+	}
+
+	/** Drive [devId]'s vibrator(s) with the PS2 large/high motor intensities for [ms].
+	 *  When the controller exposes no usable vibrator and [allowSystemFallback] is set,
+	 *  drive the device's own haptic motor instead (issue #241 — handhelds like the
+	 *  Odin 3 whose built-in gamepad has no rumble actuator, only system haptics). */
+	private static void vibrateDevice(int devId, float low, float high, int ms, boolean allowSystemFallback) {
+		try {
+			// Single combined motor can't reproduce both PS2 actuators, so blend
+			// them the way AetherSX2/NetherSX2 do (org.libsdl.app
+			// SDLControllerManager): 0.6*large + 0.4*small. The PS2 small motor is
+			// BINARY (full-scale 0xff whenever it pulses), so the old Math.max()
+			// slammed the lone motor to FULL on every small-motor buzz — it felt
+			// like the large motor was firing for small-motor events. The weighted
+			// mix keeps a small-only pulse light and distinct from a large pulse.
+			float combined = Math.min(1f, low * 0.6f + high * 0.4f);
+			boolean drove = false;
+			InputDevice dev = (devId >= 0) ? InputDevice.getDevice(devId) : null;
+			if (dev != null) {
+				if (Build.VERSION.SDK_INT >= 31) {
+					VibratorManager vm = dev.getVibratorManager();
+					int[] ids = vm.getVibratorIds();
+					if (ids.length >= 2) {
+						drove = rumbleOne(vm.getVibrator(ids[0]), low, ms);
+						drove |= rumbleOne(vm.getVibrator(ids[1]), high, ms);
+					} else if (ids.length == 1) {
+						drove = rumbleOne(vm.getVibrator(ids[0]), combined, ms);
+					} else {
+						// Some pads (e.g. certain DualShock/DualSense BT modes) expose 0
+						// vibrators to VibratorManager but still drive via the legacy API.
+						drove = rumbleOne(dev.getVibrator(), combined, ms);
+					}
+				} else {
+					drove = rumbleOne(dev.getVibrator(), combined, ms);
+				}
+			}
+			// No controller actuator handled it → fall back to the device's built-in
+			// haptic (issue #241), when permitted (Player 1 / explicit test) so a
+			// vibrator-less P2 pad never buzzes the handheld that P1 is holding.
+			if (!drove && allowSystemFallback) {
+				rumbleOne(systemVibrator(), combined, ms);
+			}
+		} catch (Throwable ignored) {
+		}
+	}
+
+	/** @return true if [v] is a real, usable vibrator that was driven (or cancelled). */
+	private static boolean rumbleOne(Vibrator v, float intensity, int ms) {
+		if (v == null || !v.hasVibrator()) return false;
+		if (intensity <= 0f) {
+			try { v.cancel(); } catch (Throwable ignored) {}
+			return true;
+		}
+		int amp = Math.round(intensity * 255f);
+		if (amp < 1) amp = 1;
+		if (amp > 255) amp = 255;
+		try {
+			v.vibrate(VibrationEffect.createOneShot(ms, amp));
+		} catch (Throwable t) {
+			try { v.vibrate(ms); } catch (Throwable ignored) {}
+		}
+		return true;
+	}
+
+	// The device's own haptic motor (system vibrator), resolved once. On handhelds
+	// like the Odin 3 the built-in gamepad exposes no rumble actuator — only this —
+	// so it's the fallback target when a controller has no usable vibrator (issue #241).
+	private static volatile Vibrator sSystemVibrator;
+	private static Vibrator systemVibrator() {
+		Vibrator v = sSystemVibrator;
+		if (v != null) return v;
+		try {
+			Context ctx = getContext();
+			if (ctx != null) {
+				if (Build.VERSION.SDK_INT >= 31) {
+					VibratorManager vm = (VibratorManager) ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+					v = (vm != null) ? vm.getDefaultVibrator() : null;
+				} else {
+					v = (Vibrator) ctx.getSystemService(Context.VIBRATOR_SERVICE);
+				}
+				if (v != null) sSystemVibrator = v;
+			}
+		} catch (Throwable ignored) {
+		}
+		return v;
+	}
+
+	// Short crisp haptic "tick" for on-screen touch button presses (issue #247),
+	// PPSSPP/Azahar-style. Driven by the device's own vibrator and INDEPENDENT of
+	// game rumble. The UI gates it via the Touch Haptics setting, so this is only
+	// invoked when enabled. Coalesced: simultaneous multi-touch presses (d-pad +
+	// face land in the same frame) collapse to ONE tick, and fast mashing is rate-
+	// limited, so the vibrator queue can't be saturated on low-end devices.
+	private static volatile long sLastTouchHapticMs = 0L;
+	public static void touchHaptic() {
+		long now = android.os.SystemClock.uptimeMillis();
+		if (now - sLastTouchHapticMs < 24L) return;
+		sLastTouchHapticMs = now;
+		try { rumbleOne(systemVibrator(), 0.6f, 12); } catch (Throwable ignored) {}
+	}
+
+	/** Index (0-based) of the [index]th connected physical gamepad, or -1. Used as a
+	 *  fallback so the rumble test works even before a port has been claimed in-game. */
+	private static int nthGamepadDeviceId(int index) {
+		int n = 0;
+		for (int id : InputDevice.getDeviceIds()) {
+			InputDevice d = InputDevice.getDevice(id);
+			if (d == null) continue;
+			int src = d.getSources();
+			boolean pad = (src & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+					|| (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+			if (!pad) continue;
+			if (n == index) return id;
+			n++;
+		}
+		return -1;
+	}
+
+	/** Strongly buzz the controller mapped to [port] (0 = P1, 1 = P2) for ~500ms.
+	 *  Falls back to the Nth gamepad when no port is claimed yet (tested outside a game). */
+	public static void testRumble(int port) {
+		int devId = com.armsx2.input.PadRouter.INSTANCE.deviceIdForPort(port);
+		if (devId < 0) devId = nthGamepadDeviceId(port);
+		// devId may stay -1 (touch-only / Odin built-in with no rumble); vibrateDevice
+		// then falls back to the device's own haptic so the test still buzzes (issue #241).
+		vibrateDevice(devId, 0.9f, 0.9f, 500, true);
+	}
+
+	/** One-line report of [port]'s controller and whether Android exposes any vibrator
+	 *  for it (new VibratorManager + legacy API). Lets the Pad tab tell the user whether
+	 *  a missing rumble is a routing issue or the pad just isn't drivable by Android. */
+	public static String rumbleStatusForPort(int port) {
+		int devId = com.armsx2.input.PadRouter.INSTANCE.deviceIdForPort(port);
+		boolean mapped = devId >= 0;
+		if (devId < 0) devId = nthGamepadDeviceId(port);
+		if (devId < 0) return "Player " + (port + 1) + ": no controller found";
+		InputDevice d = InputDevice.getDevice(devId);
+		String name = (d != null && d.getName() != null) ? d.getName() : ("device " + devId);
+		int vmCount = 0;
+		boolean legacy = false;
+		try {
+			Vibrator lv = (d != null) ? d.getVibrator() : null;
+			legacy = lv != null && lv.hasVibrator();
+		} catch (Throwable ignored) {}
+		if (Build.VERSION.SDK_INT >= 31 && d != null) {
+			try { vmCount = d.getVibratorManager().getVibratorIds().length; } catch (Throwable ignored) {}
+		}
+		boolean hasRumble = vmCount > 0 || legacy;
+		int motors = Math.max(vmCount, legacy ? 1 : 0);
+		return "Player " + (port + 1) + ": " + name
+				+ (mapped ? "" : " (not active in-game yet)")
+				+ (hasRumble ? " — rumble OK (" + motors + " motor" + (motors == 1 ? "" : "s") + ")"
+						: " — NO rumble exposed by Android");
+	}
 
 	public static native void setAspectRatio(int type);
 	public static native void speedhackLimitermode(int value);
@@ -245,6 +450,10 @@ public class NativeApp {
 	 *  display swap, so emulation keeps running at 100% speed while the
 	 *  on-screen FPS is limited. Applies live. */
 	public static native void setFpsCap(int fps);
+	/** Per-region emulated PS2 vsync rate (NTSC / PAL Hz), applied live without a
+	 *  restart — recomputes the vsync pacer + target speed. Parks the VM briefly
+	 *  (keeps audio alive), so call it off the UI thread (via LiveGsApplyQueue). */
+	public static native void applyFramerateLive(float ntsc, float pal);
 	/** Frame skip: present 1 frame, skip the next N (0 = off). Display-only
 	 *  throttle; applies live. */
 	public static native void setFrameSkip(int skip);
@@ -343,6 +552,11 @@ public class NativeApp {
 	 */
 	public static native int getCompatibilityForSerial(String serial);
 
+	/** GameDB region string for a serial ("NTSC-U", "PAL-E", "PAL-IN", "NTSC-C", "NTSC-K",
+	 *  "NTSC-HK", ...), or "" if the serial isn't in the database. Lets the library show
+	 *  the real region (India/China/Korea/HK) a serial prefix alone can't distinguish. */
+	public static native String getRegionForSerial(String serial);
+
 	public static native boolean saveStateToSlot(int slot);
 	public static native boolean loadStateFromSlot(int slot);
 	public static native String getGamePathSlot(int slot);
@@ -396,5 +610,23 @@ public class NativeApp {
 			} catch (Exception ignored) {}
 		}
 		return -1;
+	}
+
+	// Fallback directory creation for native FileSystem::CreateDirectoryPath.
+	// On Android 11+ FUSE-emulated external storage a raw libc mkdir() can be
+	// denied (EACCES/EPERM) for MANAGE_EXTERNAL_STORAGE apps even though the
+	// Java File API succeeds — which is why FOLDER memory cards failed to
+	// format ("Format failed!") on a custom data folder while file cards
+	// worked. Returns true if the directory exists after the call.
+	public static boolean createDirectoryPath(String path) {
+		if (path == null || path.isEmpty()) return false;
+		try {
+			java.io.File dir = new java.io.File(path);
+			if (dir.isDirectory()) return true;
+			dir.mkdirs();
+			return dir.isDirectory();
+		} catch (Throwable t) {
+			return false;
+		}
 	}
 }

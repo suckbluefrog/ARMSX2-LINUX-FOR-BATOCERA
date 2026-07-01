@@ -189,6 +189,80 @@ internal object SettingsControllerNav {
         return true
     }
 
+    /** 2D spatial navigation using captured on-screen positions: move to the
+     *  nearest focusable in the (dx, dy) direction. Used by the memory-card dialog
+     *  so Left/Right move between a card's Slot 1 / Slot 2 buttons and Up/Down move
+     *  between rows — the 1D [move] made the 2-button card rows feel stuck on Slot 1
+     *  (any direction just stepped the flat list). Falls back to [move] when nothing
+     *  is selected yet. positions[id] = (y, x). */
+    fun moveSpatial(dx: Int, dy: Int): Boolean {
+        if (dx == 0 && dy == 0) return false
+        val curId = selectedId.value
+        val cur = curId?.let { positions[it] }
+        if (cur == null) {
+            val moved = move(if (dx < 0 || dy < 0) -1 else 1)
+            android.util.Log.d("ARMSX2_MCNAV", "moveSpatial dx=$dx dy=$dy cur=$curId NO_POS -> fallback move=$moved")
+            return moved
+        }
+        val cy = cur.first
+        val cx = cur.second
+        val rowTol = 28f // px; items within this |dy| count as the same visual row
+
+        val target: String? = if (dy != 0) {
+            // Vertical: step exactly ONE row in the travel direction, then land on the
+            // item in that row whose x is closest to the current x. Row-based (not a
+            // per-item distance score) so Up and Down are symmetric and can never skip
+            // a row or pick a far diagonal item — the old score could make Up land
+            // nowhere useful on the card grid.
+            var rowY: Float? = null
+            for ((id, p) in positions) {
+                if (id == curId || registry[id] == null) continue
+                val py = p.first
+                if (dy < 0 && py >= cy - rowTol) continue   // need a row strictly above
+                if (dy > 0 && py <= cy + rowTol) continue   // need a row strictly below
+                rowY = when {
+                    rowY == null -> py
+                    dy < 0 -> if (py > rowY!!) py else rowY  // up: highest row still above
+                    else -> if (py < rowY!!) py else rowY    // down: lowest row still below
+                }
+            }
+            val ry = rowY
+            if (ry == null) null else {
+                var bestId: String? = null
+                var bestDx = Float.MAX_VALUE
+                for ((id, p) in positions) {
+                    if (id == curId || registry[id] == null) continue
+                    if (kotlin.math.abs(p.first - ry) > rowTol) continue
+                    val d = kotlin.math.abs(p.second - cx)
+                    if (d < bestDx) { bestDx = d; bestId = id }
+                }
+                bestId
+            }
+        } else {
+            // Horizontal: nearest focusable in the dx direction on (roughly) the same row.
+            var bestId: String? = null
+            var bestScore = Float.MAX_VALUE
+            for ((id, p) in positions) {
+                if (id == curId || registry[id] == null) continue
+                val ddx = p.second - cx
+                val ddy = p.first - cy
+                val inDir = if (dx > 0) ddx > 1f && kotlin.math.abs(ddy) < rowTol
+                            else ddx < -1f && kotlin.math.abs(ddy) < rowTol
+                if (!inDir) continue
+                val score = kotlin.math.abs(ddx) + kotlin.math.abs(ddy) * 4f
+                if (score < bestScore) { bestScore = score; bestId = id }
+            }
+            bestId
+        }
+
+        android.util.Log.d("ARMSX2_MCNAV",
+            "moveSpatial dx=$dx dy=$dy cur=$curId curY=$cy curX=$cx n=${positions.size} -> $target")
+        if (target == null) return false
+        selectedId.value = target
+        selectedIndex.value = orderedIds().indexOf(target)
+        return true
+    }
+
     fun adjust(delta: Int): Boolean {
         if (delta == 0) return false
         val item = selectedItem() ?: return false
@@ -334,6 +408,48 @@ fun SettingsDivider() {
     )
 }
 
+/** Collapsible settings section: a tappable header (▸ collapsed / ▾ expanded) that
+ *  shows or hides its content. Controller-focusable so a gamepad can open it. Shared
+ *  by the Fixes / Pad / Performance / Renderer tabs to de-bloat long settings lists.
+ *  [initiallyExpanded] lets a tab open its most-used section by default. */
+@Composable
+fun CollapsibleSection(
+    title: String,
+    initiallyExpanded: Boolean = false,
+    content: @Composable () -> Unit,
+) {
+    // Persist the collapse/expand choice per section so it survives reopening the
+    // settings — when tuning a game you shouldn't have to re-unroll the same section
+    // every time. [initiallyExpanded] is only the first-time default.
+    val prefKey = "ui.section.$title"
+    var expanded by remember(title) {
+        mutableStateOf(com.armsx2.Main.prefs.getBoolean(prefKey, initiallyExpanded))
+    }
+    fun toggle() {
+        expanded = !expanded
+        com.armsx2.Main.prefs.edit().putBoolean(prefKey, expanded).apply()
+    }
+    Spacer(Modifier.height(8.dp))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .controllerFocusable(controllerId = "sect:$title", onConfirm = { toggle() })
+            .clickable { toggle() }
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            title,
+            color = Colors.pasx2_blue,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.weight(1f),
+        )
+        Text(if (expanded) "▾" else "▸", color = Colors.pasx2_blue, fontSize = 12.sp)
+    }
+    if (expanded) content()
+}
+
 @Composable
 fun HelpText(text: String, modifier: Modifier = Modifier) {
     Text(
@@ -416,7 +532,10 @@ fun ToggleBubble(
     }
     Column(
         modifier = modifier
-            .aspectRatio(1.35f)
+            // Wider ratio = shorter cell, so the gamefix/speedhack grids
+            // (5+ rows of four) fit small-screen panels with far less
+            // scrolling. The On/Off label + state line still fit at ~60dp.
+            .aspectRatio(2.0f)
             .clip(RoundedCornerShape(10.dp))
             .background(bg)
             .border(1.dp, border, RoundedCornerShape(10.dp))

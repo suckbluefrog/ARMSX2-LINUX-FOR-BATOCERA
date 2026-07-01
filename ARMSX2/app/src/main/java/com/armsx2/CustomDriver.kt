@@ -37,10 +37,32 @@ object CustomDriver {
 
     private const val TAG = "CustomDriver"
 
-    /** Source repo for the remote driver list. Releases here ship zip
-     *  assets with `meta.json` + `libvulkan_freedreno.so` at the root. */
-    private const val GITHUB_RELEASES_URL =
-        "https://api.github.com/repos/K11MCH1/AdrenoToolsDrivers/releases"
+    /** Source repos for the remote driver list. Each ships GitHub releases
+     *  whose .zip assets are adrenotools driver packs (`meta.json` +
+     *  `libvulkan_freedreno.so` at the root; meta.json is synthesized when a
+     *  pack omits it). Listed in display order.
+     *
+     *  `idPrefix` is folded into each driver's id so two repos can't collide
+     *  (and so a re-listed driver still matches its install). It is EMPTY for
+     *  K11MCH1 so its ids stay byte-identical to older builds — existing
+     *  installs keep matching; only new sources get a prefix. */
+    private data class DriverSource(
+        val label: String,
+        val releasesUrl: String,
+        val idPrefix: String,
+    )
+    private val DRIVER_SOURCES = listOf(
+        DriverSource(
+            "AdrenoToolsDrivers",
+            "https://api.github.com/repos/K11MCH1/AdrenoToolsDrivers/releases",
+            "",
+        ),
+        DriverSource(
+            "MrPurple · purple-turnip",
+            "https://api.github.com/repos/MrPurple666/purple-turnip/releases",
+            "purpleturnip",
+        ),
+    )
 
     /** Sane default for the driver's library soname when meta.json
      *  doesn't include one. Every Turnip release we care about uses
@@ -74,6 +96,7 @@ object CustomDriver {
         val publishedAt: String,
         val assetUrl: String,
         val sizeBytes: Long,
+        val source: String = "",
     )
 
     // ---- Installed drivers --------------------------------------------------
@@ -134,11 +157,27 @@ object CustomDriver {
         val userAgent = "ARMSX2/" + runCatching {
             NativeApp.getBuildVersion()
         }.getOrNull().orEmpty().ifEmpty { "dev" }
+        val out = mutableListOf<RemoteDriver>()
+        val seen = HashSet<String>()
+        // Sequential per source; one dead/rate-limited source returns empty and
+        // never blanks the others. Dedup by id guards the LazyVerticalGrid key set.
+        for (src in DRIVER_SOURCES) {
+            for (rd in fetchSource(src, userAgent)) {
+                if (seen.add(rd.id)) out += rd
+            }
+        }
+        return out
+    }
+
+    /** Fetch one source's releases and flatten into one RemoteDriver per .zip
+     *  asset. Empty on any network/parse error so a single failing source can't
+     *  blank the whole list. */
+    private fun fetchSource(src: DriverSource, userAgent: String): List<RemoteDriver> {
         val resp = runCatching {
-            HttpClient.doRequest(GITHUB_RELEASES_URL, "GET", null, userAgent, 15000)
+            HttpClient.doRequest(src.releasesUrl, "GET", null, userAgent, 15000)
         }.getOrNull() ?: return emptyList()
         if (resp.statusCode != 200 || resp.data.isEmpty()) {
-            Log.w(TAG, "fetchRemote: status=${resp.statusCode}, size=${resp.data.size}")
+            Log.w(TAG, "fetchRemote(${src.label}): status=${resp.statusCode}, size=${resp.data.size}")
             return emptyList()
         }
 
@@ -159,18 +198,19 @@ object CustomDriver {
                 val url = asset.optString("browser_download_url")
                 if (url.isEmpty()) continue
                 val size = asset.optLong("size", 0L)
+                // ID scopes by tag (a repo can ship the same asset filename in
+                // multiple releases) and by source prefix (so two repos can't
+                // collide). idPrefix is "" for K11MCH1 → ids unchanged.
+                val idTag = if (src.idPrefix.isEmpty()) tag else "${src.idPrefix}-$tag"
                 out += RemoteDriver(
-                    // ID must scope by tag too — K11MCH1 ships the same
-                    // asset filename across multiple releases (e.g.
-                    // 8elite2-842.6.zip in two tags), which would collide
-                    // in the LazyVerticalGrid key set otherwise.
-                    id = makeId(tag, assetName),
+                    id = makeId(idTag, assetName),
                     releaseName = releaseName,
                     assetName = assetName,
                     tagName = tag,
                     publishedAt = publishedAt,
                     assetUrl = url,
                     sizeBytes = size,
+                    source = src.label,
                 )
             }
         }

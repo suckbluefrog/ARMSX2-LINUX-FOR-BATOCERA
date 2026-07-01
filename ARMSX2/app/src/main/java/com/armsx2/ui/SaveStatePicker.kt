@@ -74,8 +74,8 @@ import java.util.Locale
  *     Restore copies the last snapshot back (with confirm),
  *   - the "Auto-save on exit" switch (global pref) makes Close Game write
  *     the autosave slot automatically instead of prompting.
- * File ops run in Kotlin (the app holds MANAGE_EXTERNAL_STORAGE) off the
- * main thread; `refreshTick` re-probes the tiles afterward.
+ * File ops run in Kotlin against the emulator data folder off the main
+ * thread; `refreshTick` re-probes the tiles afterward.
  *
  * Autosave tile (Load mode only, shown above slot 0 when present): the
  * "Save State And Exit" action writes a dedicated `.autosave.p2s` rather

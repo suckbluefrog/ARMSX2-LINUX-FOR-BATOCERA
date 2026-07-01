@@ -24,6 +24,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,7 +40,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.armsx2.CustomDriver
 import com.armsx2.Main
+import com.armsx2.config.Settings
 import com.armsx2.ui.Colors
+import com.armsx2.ui.InGameOverlay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -64,14 +67,14 @@ import kotlinx.coroutines.withContext
  * game (mirrors the toolbar RestartButton).
  */
 @Composable
-fun RendererBackendSection() {
+fun RendererBackendSection(state: MutableState<Settings>) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
+    val s = state.value
 
     val rendererIds = listOf("auto", "opengl", "vulkan", "software")
     val rendererLabels = listOf("Auto", "OpenGL", "Vulkan", "Software")
-    val currentRenderer = Main.renderer.value
-    val selIdx = rendererIds.indexOf(currentRenderer).coerceAtLeast(0)
+    val selIdx = rendererIds.indexOf(s.renderer).coerceAtLeast(0)
 
     SegmentedRow(
         label = "Graphics API",
@@ -79,9 +82,12 @@ fun RendererBackendSection() {
         selectedIndex = selIdx,
         onChange = { idx ->
             val pick = rendererIds[idx]
-            if (pick != Main.renderer.value) {
+            if (pick != s.renderer) {
+                // Persist scope-aware (per-game when the overlay scope is Game).
+                // The backend switch itself happens on the next renderer start
+                // (Apply & Restart / next launch → Main.applyRendererPrefs).
+                InGameOverlay.saveSettings(s.copy(renderer = pick))
                 Main.renderer.value = pick
-                Main.prefs.edit().putString("renderer", pick).apply()
                 // A custom driver is only meaningful for Vulkan — drop the
                 // pick on the OGL/Auto path so it doesn't linger as a stale
                 // selection if the user toggles back.
@@ -93,7 +99,7 @@ fun RendererBackendSection() {
         },
     )
 
-    if (Main.renderer.value == "vulkan") {
+    if (s.renderer == "vulkan") {
         SettingsDivider()
         GpuDriverSection(context, scope)
     }
@@ -357,7 +363,10 @@ private fun DriverBrowserRow(
             Column(modifier = Modifier.weight(1f)) {
                 Text(remote.assetName, color = Color.White, fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(remote.releaseName, color = Color(0xFFAAAAAA), fontSize = 11.sp,
+                Text(
+                    if (remote.source.isNotEmpty()) "${remote.source} · ${remote.releaseName}"
+                    else remote.releaseName,
+                    color = Color(0xFFAAAAAA), fontSize = 11.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Spacer(Modifier.width(10.dp))

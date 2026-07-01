@@ -759,6 +759,7 @@ Pcsx2Config::GSOptions::GSOptions()
 	UseBlitSwapChain = false;
 	DisableShaderCache = false;
 	DisableFramebufferFetch = false;
+	EnableAdrenoFramebufferFetch = false;
 	DisableVertexShaderExpand = false;
 	SkipDuplicateFrames = true;
 	OsdMessagesPos = OsdOverlayPos::TopLeft;
@@ -949,6 +950,7 @@ bool Pcsx2Config::GSOptions::RestartOptionsAreEqual(const GSOptions& right) cons
 		   OpEqu(UseBlitSwapChain) &&
 		   OpEqu(DisableShaderCache) &&
 		   OpEqu(DisableFramebufferFetch) &&
+		   OpEqu(EnableAdrenoFramebufferFetch) &&
 		   OpEqu(DisableVertexShaderExpand) &&
 		   OpEqu(OverrideTextureBarriers) &&
 		   OpEqu(DepthFeedbackMode) &&
@@ -997,6 +999,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(UseBlitSwapChain);
 	SettingsWrapBitBool(DisableShaderCache);
 	SettingsWrapBitBool(DisableFramebufferFetch);
+	SettingsWrapBitBool(EnableAdrenoFramebufferFetch);
 	SettingsWrapBitBool(DisableVertexShaderExpand);
 	SettingsWrapBitBool(SkipDuplicateFrames);
 	SettingsWrapBitBool(OsdShowSpeed);
@@ -2407,6 +2410,26 @@ bool EmuFolders::EnsureFoldersExist()
 	result = FileSystem::CreateDirectoryPath(Videos.c_str(), false) && result;
 	result = FileSystem::CreateDirectoryPath(DebuggerLayouts.c_str(), false) && result;
 	result = FileSystem::CreateDirectoryPath(DebuggerSettings.c_str(), false) && result;
+
+#ifdef __ANDROID__
+	// Android's MediaScanner indexes image files (PNG/DDS replacement textures
+	// and texture dumps) in any folder without a .nomedia marker, so on the
+	// shared-storage "sdcard" data setting the user's texture packs end up in
+	// their gallery/camera roll. Drop a .nomedia in the textures folder only —
+	// the scanner applies it recursively, so it also covers the per-game
+	// dumps/replacements subdirs. Screenshots (snaps), cover art and videos are
+	// intentionally left out so they STILL appear in the gallery.
+	if (!Textures.empty())
+	{
+		const std::string marker(Path::Combine(Textures, ".nomedia"));
+		if (!FileSystem::FileExists(marker.c_str()))
+		{
+			if (std::FILE* fp = FileSystem::OpenCFile(marker.c_str(), "wb"))
+				std::fclose(fp);
+		}
+	}
+#endif
+
 	return result;
 }
 

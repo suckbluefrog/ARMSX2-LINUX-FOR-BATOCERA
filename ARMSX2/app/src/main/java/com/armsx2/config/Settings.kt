@@ -71,8 +71,11 @@ data class Settings(
      *  fast-forward. Stored as percent; written to emucore as the 0.05..10.0
      *  float scalar. */
     val nominalSpeedPercent: Int = 100,
-    /** Deprecated Android-only FPS cap. Kept for JSON compatibility with test
-     *  builds, but no longer applied because it skipped GS rendering. */
+    /** Max presented-FPS cap, independent of [nominalSpeedPercent] and the Speed
+     *  Limit %. 0 = off. When > 0 the native side caps the DISPLAY frame rate by
+     *  dropping presents on the GS thread while emulation keeps running full
+     *  speed — it does NOT slow the game. Adaptive: a game already at/below the
+     *  target is unaffected (no over-skip). */
     val fpsLimit: Int = 0,
     /** Deprecated Android-only frame skip. Kept for JSON compatibility only. */
     val frameSkip: Int = 0,
@@ -92,6 +95,10 @@ data class Settings(
     val audioOutputLatencyMs: Int = 20,
     /** SPU2/Output/FastForwardVolume — output volume % while fast-forwarding. */
     val audioFastForwardVolume: Int = 100,
+    /** SPU2/NeonReverbSIMD — opt-in NEON reverb FIR on ARM64. Frees CPU on
+     *  CPU-bound devices; default off uses the scalar reference (unchanged
+     *  audio). Applied on the next game boot/reset. */
+    val spu2NeonReverb: Boolean = false,
 
     // ---- EmuCore — patches / cheats ----
     /** EmuCore/EnablePatches — game-compatibility patches (default on). */
@@ -104,8 +111,17 @@ data class Settings(
     val enableNoInterlacingPatches: Boolean = false,
     /** EmuCore/EnableFastBoot — skip BIOS splash and boot straight to the game. */
     val enableFastBoot: Boolean = false,
-    /** EmuCore/EnableGameFixes — master switch for game-specific compatibility hacks. */
-    val enableGameFixes: Boolean = false,
+    /** EmuCore/HostFs — host: filesystem access in the VM, for ELF/homebrew and mods
+     *  (e.g. modded Persona 3 FES). Per-game capable; applies on the next game boot. */
+    val hostFs: Boolean = false,
+    /** EmuCore/EnableGameFixes — master switch that lets the GameDB apply each game's
+     *  curated compatibility gamefixes (e.g. VuAddSubHack, SkipMPEGHack). Defaults TRUE
+     *  to match upstream PCSX2 (Pcsx2Config.cpp EnableGameFixes = true) and trak's Mac:
+     *  Android was the outlier defaulting it false, which silently skipped every GameDB
+     *  CPU gamefix — that's what broke Valkyrie Profile 2 (needs VuAddSubHack; without it
+     *  the first VU0 program diverges and the EE derails to PC=0) and made Skip MPEG inert.
+     *  GameDB gamefixes are per-game curated, so on-by-default only helps compatibility. */
+    val enableGameFixes: Boolean = true,
     /** EmuCore/Gamefixes/SoftwareRendererFMVHack. */
     val gamefixSoftwareRendererFmv: Boolean = false,
     /** EmuCore/Gamefixes/SkipMPEGHack. */
@@ -163,6 +179,20 @@ data class Settings(
     val syncToHostRefresh: Boolean = false,
     /** EmuCore/GS/DisableFramebufferFetch — disable the framebuffer-fetch path. Default off. */
     val disableFramebufferFetch: Boolean = false,
+    /** EmuCore/GS/HWROV — Rasterizer Order Views (accurate blending via fragment-shader
+     *  interlock; Vulkan only). Default OFF on mobile: it's a perf loss on tilers and is
+     *  inert on Turnip/Adreno (no VK_EXT_fragment_shader_interlock), so on-by-default just
+     *  costs frames for no gain. Upstream PCSX2 defaults it true (desktop); we override to
+     *  false for Android. Users can still enable it in Renderer for benchmarking. */
+    val hwRov: Boolean = false,
+    /** EmuCore/GS/HWAA1 — hardware PS2 AA1 edge anti-aliasing. Default off. Applies on game restart. */
+    val hwAa1: Boolean = false,
+    /** EmuCore/GS/HWAccurateAlphaTest — accurate alpha test for the HW renderer (pairs with ROV). Default off. */
+    val hwAat: Boolean = false,
+    /** EmuCore/GS/EnableAdrenoFramebufferFetch — opt-in: enable the Vulkan framebuffer-fetch
+     * (ROAA) accurate-blending fast path on non-Mali (Adreno) GPUs that expose the extension.
+     * Experimental; default off. Applies on game restart. */
+    val adrenoFbFetch: Boolean = false,
     /** EmuCore/GS/OverrideTextureBarriers — -1 Auto / 0 Off / 1 On. */
     val overrideTextureBarriers: Int = -1,
     /** EmuCore/GS/DisableVertexShaderExpand — force CPU vertex expansion. Renderer-init; restart to apply. */
@@ -201,6 +231,20 @@ data class Settings(
     /** EmuCore/GS/AspectRatio:
      *  0 Stretch · 1 Auto 4:3/3:2 · 2 4:3 · 3 16:9 · 4 10:7. */
     val aspectRatio: Int = 1,
+    /** Host graphics API: "auto" / "opengl" / "vulkan" / "software". Applied via
+     *  the renderer JNI helpers on (re)launch; per-game so each title can pick its
+     *  own backend. Seeded from the legacy global "renderer" pref on first load. */
+    val renderer: String = "auto",
+    /** Internal resolution multiplier (0.25..5.0; 1.0 = native). Applied live via
+     *  the GS upscale helper; per-game so each title keeps its own. Seeded from the
+     *  legacy global "upscaleFloat" pref on first load. */
+    val upscaleFloat: Float = 1.0f,
+    /** EmuCore/GS FramerateNTSC — the emulated PS2 vsync rate for NTSC games
+     *  (PCSX2 default 59.94). Lowering it slows the game's target rate; raising it
+     *  speeds it up. Mirrors NetherSX2's "Framerate For NTSC". */
+    val framerateNtsc: Float = 59.94f,
+    /** EmuCore/GS FrameratePAL — emulated PS2 vsync rate for PAL games (default 50.00). */
+    val frameratePal: Float = 50.00f,
     /** EmuCore/GS/deinterlace_mode — GSInterlaceMode:
      *  0 Auto · 1 Off · 2/3 Weave · 4/5 Bob · 6/7 Blend · 8/9 Adaptive. */
     val deinterlaceMode: Int = 0,
@@ -346,6 +390,10 @@ data class Settings(
     val osdShowGsStats: Boolean = true,
     /** EmuCore/GS/OsdShowFrameTimes. */
     val osdShowFrameTimes: Boolean = true,
+    /** EmuCore/GS/OsdShowHardwareInfo — the CPU/GPU model info line. */
+    val osdShowHardwareInfo: Boolean = true,
+    /** EmuCore/GS/OsdShowVersion — the emulator version line. */
+    val osdShowVersion: Boolean = true,
     /** EmuCore/GS/UserHacks_AutoFlushLevel — GSHWAutoFlushLevel:
      *  0 Disabled · 1 SpritesOnly · 2 Enabled. */
     val autoFlush: Int = 0,
@@ -417,133 +465,156 @@ data class Settings(
      *  a renderer restart to take effect. */
     val gpuProfile: Int = 0,
 ) {
+    /** Routes a persisted-key write to the native base layer, or to
+     *  [emitSink] when a per-game INI export is capturing the key set (see
+     *  [writeGameSettingsIni]). Replaces the direct NativeApp.setSetting calls
+     *  so applyTo/writeGsToNative can be reused as the single source of the
+     *  field→EmuCore-key mapping for the export — no duplicated key list. */
+    private fun put(section: String, key: String, type: String, value: String) {
+        val sink = emitSink
+        if (sink != null) sink(section, key, type, value)
+        else NativeApp.setSetting(section, key, type, value)
+    }
+
     /** Push every field into emucore via NativeApp.setSetting + commit. */
     fun applyTo() {
         // Speedhacks
-        NativeApp.setSetting("EmuCore/Speedhacks", "EECycleRate", "int", eeCycleRate.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "EECycleSkip", "int", eeCycleSkip.toString())
+        put("EmuCore/Speedhacks", "EECycleRate", "int", eeCycleRate.toString())
+        put("EmuCore/Speedhacks", "EECycleSkip", "int", eeCycleSkip.toString())
         // EE/FPU + VU clamping (recompiler accuracy). Each mode unpacks to the
         // PCSX2 bit flags below; both VUs get the same mode. Needs a recompiler
         // reset (commitSettings / game restart) to take effect.
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "fpuOverflow", "bool", (eeClampMode >= 1).toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "fpuExtraOverflow", "bool", (eeClampMode >= 2).toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "fpuFullMode", "bool", (eeClampMode >= 3).toString())
+        put("EmuCore/CPU/Recompiler", "fpuOverflow", "bool", (eeClampMode >= 1).toString())
+        put("EmuCore/CPU/Recompiler", "fpuExtraOverflow", "bool", (eeClampMode >= 2).toString())
+        put("EmuCore/CPU/Recompiler", "fpuFullMode", "bool", (eeClampMode >= 3).toString())
         for (vu in arrayOf("vu0", "vu1")) {
-            NativeApp.setSetting("EmuCore/CPU/Recompiler", "${vu}Overflow", "bool", (vuClampMode >= 1).toString())
-            NativeApp.setSetting("EmuCore/CPU/Recompiler", "${vu}ExtraOverflow", "bool", (vuClampMode >= 2).toString())
-            NativeApp.setSetting("EmuCore/CPU/Recompiler", "${vu}SignOverflow", "bool", (vuClampMode >= 3).toString())
+            put("EmuCore/CPU/Recompiler", "${vu}Overflow", "bool", (vuClampMode >= 1).toString())
+            put("EmuCore/CPU/Recompiler", "${vu}ExtraOverflow", "bool", (vuClampMode >= 2).toString())
+            put("EmuCore/CPU/Recompiler", "${vu}SignOverflow", "bool", (vuClampMode >= 3).toString())
         }
-        NativeApp.setSetting("EmuCore/Speedhacks", "vuThread", "bool", mtvu.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "vu1Instant", "bool", vu1Instant.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "vuFlagHack", "bool", vuFlagHack.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "fastCDVD", "bool", fastCDVD.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "IntcStat", "bool", intcStat.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "WaitLoop", "bool", waitLoop.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "vuNeonFusions", "bool", vuNeonFusions.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "vuDeferredWrites", "bool", vuDeferredWrites.toString())
-        NativeApp.setSetting("EmuCore/Speedhacks", "vuSkipStallSim", "bool", vuSkipStallSim.toString())
+        put("EmuCore/Speedhacks", "vuThread", "bool", mtvu.toString())
+        put("EmuCore/Speedhacks", "vu1Instant", "bool", vu1Instant.toString())
+        put("EmuCore/Speedhacks", "vuFlagHack", "bool", vuFlagHack.toString())
+        put("EmuCore/Speedhacks", "fastCDVD", "bool", fastCDVD.toString())
+        put("EmuCore/Speedhacks", "IntcStat", "bool", intcStat.toString())
+        put("EmuCore/Speedhacks", "WaitLoop", "bool", waitLoop.toString())
+        put("EmuCore/Speedhacks", "vuNeonFusions", "bool", vuNeonFusions.toString())
+        put("EmuCore/Speedhacks", "vuDeferredWrites", "bool", vuDeferredWrites.toString())
+        put("EmuCore/Speedhacks", "vuSkipStallSim", "bool", vuSkipStallSim.toString())
         // GS frame limit. The setting key is persisted (read by runVMThread
         // after Initialize so cold starts honor the preference) AND the live
         // limiter mode is poked via speedhackLimitermode so toggling in-game
         // takes effect immediately. 0 = Nominal (capped at native rate),
         // 3 = Unlimited.
-        NativeApp.setSetting("EmuCore/GS", "FrameLimitEnable", "bool", frameLimitEnable.toString())
-        NativeApp.speedhackLimitermode(if (frameLimitEnable) 0 else 3)
+        put("EmuCore/GS", "FrameLimitEnable", "bool", frameLimitEnable.toString())
+        if (emitSink == null) NativeApp.speedhackLimitermode(if (frameLimitEnable) 0 else 3)
         // Framerate/NominalScalar — custom speed / FPS cap as a fraction of
         // native. commitSettings → ApplySettings → CheckForEmulationSpeedConfigChanges
         // → UpdateTargetSpeed picks this up live. Clamp mirrors emucore's
         // EmulationSpeedOptions::SanityCheck (0.05..10.0).
-        NativeApp.setSetting("Framerate", "NominalScalar", "float",
+        put("Framerate", "NominalScalar", "float",
             (nominalSpeedPercent.coerceIn(10, 1000) / 100f).toString())
         // Live-apply: the setSetting above only persists; the running frame
         // pacer needs a direct re-pace (mirrors speedhackLimitermode).
-        NativeApp.setNominalSpeed(nominalSpeedPercent.coerceIn(10, 1000))
+        if (emitSink == null) NativeApp.setNominalSpeed(nominalSpeedPercent.coerceIn(10, 1000))
+        // Max presented-FPS cap — independent of the Speed Limit % above. Caps
+        // the display rate by dropping presents on the GS thread (emulation keeps
+        // full speed, NominalScalar untouched); 0 = off. See GSRenderer::VSync.
+        if (emitSink == null) NativeApp.setFpsCap(fpsLimit.coerceIn(0, 1000))
         // Manual frameskip (0..5) — present 1 of every (N+1) frames. Held as a
         // GS-thread global, applied live; no persisted EmuCore key needed.
-        NativeApp.setFrameSkip(frameSkip.coerceIn(0, 5))
+        if (emitSink == null) NativeApp.setFrameSkip(frameSkip.coerceIn(0, 5))
         // Audio (SPU2). Volume/mute are live native setters; the rest are written
         // to the base layer and applied on commit (SPU2 stream reconfigure).
-        NativeApp.setAudioVolume(audioVolume.coerceIn(0, 200))
-        NativeApp.setAudioMuted(audioMuted)
-        NativeApp.setSetting("SPU2/Output", "SyncMode", "string", if (audioTimeStretch) "TimeStretch" else "Disabled")
-        NativeApp.setSetting("SPU2/Output", "BufferMS", "int", audioBufferMs.coerceIn(10, 200).toString())
-        NativeApp.setSetting("SPU2/Output", "OutputLatencyMS", "int", audioOutputLatencyMs.coerceIn(5, 200).toString())
-        NativeApp.setSetting("SPU2/Output", "FastForwardVolume", "int", audioFastForwardVolume.coerceIn(0, 200).toString())
+        if (emitSink == null) NativeApp.setAudioVolume(audioVolume.coerceIn(0, 200))
+        if (emitSink == null) NativeApp.setAudioMuted(audioMuted)
+        put("SPU2/Output", "SyncMode", "string", if (audioTimeStretch) "TimeStretch" else "Disabled")
+        put("SPU2/Output", "BufferMS", "int", audioBufferMs.coerceIn(10, 200).toString())
+        put("SPU2/Output", "OutputLatencyMS", "int", audioOutputLatencyMs.coerceIn(5, 200).toString())
+        put("SPU2/Output", "FastForwardVolume", "int", audioFastForwardVolume.coerceIn(0, 200).toString())
+        // Opt-in NEON reverb FIR (ARM64). Read by SPU2::InternalReset on the
+        // next game boot; default off = scalar reference (unchanged audio).
+        put("SPU2", "NeonReverbSIMD", "bool", spu2NeonReverb.toString())
         // Patches / cheats (EmuCore). Reloaded by ApplySettings →
         // CheckForPatchConfigChanges; widescreen/no-interlacing take effect on
         // the next boot for most games.
-        NativeApp.setSetting("EmuCore", "EnablePatches", "bool", enablePatches.toString())
-        NativeApp.setSetting("EmuCore", "EnableCheats", "bool", enableCheats.toString())
-        NativeApp.setSetting("EmuCore", "EnableWideScreenPatches", "bool", enableWideScreenPatches.toString())
-        NativeApp.setSetting("EmuCore", "EnableNoInterlacingPatches", "bool", enableNoInterlacingPatches.toString())
-        NativeApp.setSetting("EmuCore", "EnableFastBoot", "bool", enableFastBoot.toString())
-        NativeApp.setSetting("EmuCore", "EnableGameFixes", "bool", enableGameFixes.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "SoftwareRendererFMVHack", "bool", gamefixSoftwareRendererFmv.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "SkipMPEGHack", "bool", gamefixSkipMpeg.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "EETimingHack", "bool", gamefixEETiming.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "InstantDMAHack", "bool", gamefixInstantDma.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "BlitInternalFPSHack", "bool", gamefixBlitInternalFps.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "FpuMulHack", "bool", gamefixFpuMul.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "OPHFlagHack", "bool", gamefixOphFlag.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "GIFFIFOHack", "bool", gamefixGifFifo.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "DMABusyHack", "bool", gamefixDmaBusy.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "VIF1StallHack", "bool", gamefixVif1Stall.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "IbitHack", "bool", gamefixIbit.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "FullVU0SyncHack", "bool", gamefixFullVu0Sync.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "VuAddSubHack", "bool", gamefixVuAddSub.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "VUOverflowHack", "bool", gamefixVuOverflow.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "XgKickHack", "bool", gamefixXgkick.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "GoemonTlbHack", "bool", gamefixGoemonTlb.toString())
-        NativeApp.setSetting("EmuCore/Gamefixes", "VUSyncHack", "bool", gamefixVuSync.toString())
-        NativeApp.setSetting("EmuCore/GS", "SkipDuplicateFrames", "bool", skipDuplicateFrames.toString())
-        NativeApp.setSetting("EmuCore/CPU", "FPU.Roundmode", "int", eeFpuRoundMode.coerceIn(0, 3).toString())
-        NativeApp.setSetting("EmuCore/CPU", "VU0.Roundmode", "int", vu0RoundMode.coerceIn(0, 3).toString())
-        NativeApp.setSetting("EmuCore/CPU", "VU1.Roundmode", "int", vu1RoundMode.coerceIn(0, 3).toString())
+        put("EmuCore", "EnablePatches", "bool", enablePatches.toString())
+        put("EmuCore", "EnableCheats", "bool", enableCheats.toString())
+        put("EmuCore", "EnableWideScreenPatches", "bool", enableWideScreenPatches.toString())
+        put("EmuCore", "EnableNoInterlacingPatches", "bool", enableNoInterlacingPatches.toString())
+        put("EmuCore", "EnableFastBoot", "bool", enableFastBoot.toString())
+        put("EmuCore", "HostFs", "bool", hostFs.toString())
+        put("EmuCore", "EnableGameFixes", "bool", enableGameFixes.toString())
+        put("EmuCore/Gamefixes", "SoftwareRendererFMVHack", "bool", gamefixSoftwareRendererFmv.toString())
+        put("EmuCore/Gamefixes", "SkipMPEGHack", "bool", gamefixSkipMpeg.toString())
+        put("EmuCore/Gamefixes", "EETimingHack", "bool", gamefixEETiming.toString())
+        put("EmuCore/Gamefixes", "InstantDMAHack", "bool", gamefixInstantDma.toString())
+        put("EmuCore/Gamefixes", "BlitInternalFPSHack", "bool", gamefixBlitInternalFps.toString())
+        put("EmuCore/Gamefixes", "FpuMulHack", "bool", gamefixFpuMul.toString())
+        put("EmuCore/Gamefixes", "OPHFlagHack", "bool", gamefixOphFlag.toString())
+        put("EmuCore/Gamefixes", "GIFFIFOHack", "bool", gamefixGifFifo.toString())
+        put("EmuCore/Gamefixes", "DMABusyHack", "bool", gamefixDmaBusy.toString())
+        put("EmuCore/Gamefixes", "VIF1StallHack", "bool", gamefixVif1Stall.toString())
+        put("EmuCore/Gamefixes", "IbitHack", "bool", gamefixIbit.toString())
+        put("EmuCore/Gamefixes", "FullVU0SyncHack", "bool", gamefixFullVu0Sync.toString())
+        put("EmuCore/Gamefixes", "VuAddSubHack", "bool", gamefixVuAddSub.toString())
+        put("EmuCore/Gamefixes", "VUOverflowHack", "bool", gamefixVuOverflow.toString())
+        put("EmuCore/Gamefixes", "XgKickHack", "bool", gamefixXgkick.toString())
+        put("EmuCore/Gamefixes", "GoemonTlbHack", "bool", gamefixGoemonTlb.toString())
+        put("EmuCore/Gamefixes", "VUSyncHack", "bool", gamefixVuSync.toString())
+        put("EmuCore/GS", "SkipDuplicateFrames", "bool", skipDuplicateFrames.toString())
+        put("EmuCore/CPU", "FPU.Roundmode", "int", eeFpuRoundMode.coerceIn(0, 3).toString())
+        put("EmuCore/CPU", "VU0.Roundmode", "int", vu0RoundMode.coerceIn(0, 3).toString())
+        put("EmuCore/CPU", "VU1.Roundmode", "int", vu1RoundMode.coerceIn(0, 3).toString())
         // Display + GS renderer + hardware/upscaling-fix keys are all written
         // together in writeGsToNative() below (shared with applyGsLive()).
         // DEV9. Networking/HDD are initialized with the VM, so changes
         // made from the in-game overlay are persisted for the next boot.
-        NativeApp.setSetting("DEV9/Eth", "EthEnable", "bool", dev9EthEnable.toString())
-        NativeApp.setSetting("DEV9/Eth", "EthApi", "string", dev9EthApi)
-        NativeApp.setSetting("DEV9/Eth", "EthDevice", "string", dev9EthDevice.ifEmpty { "Auto" })
-        NativeApp.setSetting("DEV9/Eth", "EthLogDHCP", "bool", dev9EthLogDhcp.toString())
-        NativeApp.setSetting("DEV9/Eth", "EthLogDNS", "bool", dev9EthLogDns.toString())
-        NativeApp.setSetting("DEV9/Eth", "InterceptDHCP", "bool", dev9InterceptDhcp.toString())
-        NativeApp.setSetting("DEV9/Eth", "PS2IP", "string", dev9Ps2Ip.ifEmpty { "0.0.0.0" })
-        NativeApp.setSetting("DEV9/Eth", "Mask", "string", dev9Mask.ifEmpty { "0.0.0.0" })
-        NativeApp.setSetting("DEV9/Eth", "Gateway", "string", dev9Gateway.ifEmpty { "0.0.0.0" })
-        NativeApp.setSetting("DEV9/Eth", "DNS1", "string", dev9Dns1.ifEmpty { "0.0.0.0" })
-        NativeApp.setSetting("DEV9/Eth", "DNS2", "string", dev9Dns2.ifEmpty { "0.0.0.0" })
-        NativeApp.setSetting("DEV9/Eth", "AutoMask", "bool", dev9AutoMask.toString())
-        NativeApp.setSetting("DEV9/Eth", "AutoGateway", "bool", dev9AutoGateway.toString())
-        NativeApp.setSetting("DEV9/Eth", "ModeDNS1", "string", dev9ModeDns1.ifEmpty { "Auto" })
-        NativeApp.setSetting("DEV9/Eth", "ModeDNS2", "string", dev9ModeDns2.ifEmpty { "Auto" })
-        NativeApp.setSetting("DEV9/Hdd", "HddEnable", "bool", dev9HddEnable.toString())
-        NativeApp.setSetting("DEV9/Hdd", "HddFile", "string", dev9HddFile.ifEmpty { "DEV9hdd.raw" })
-        NativeApp.setSetting("MemoryCards", "Slot1_Enable", "bool", memoryCardSlot1Enabled.toString())
-        NativeApp.setSetting("MemoryCards", "Slot1_Filename", "string", memoryCardSlot1Filename.ifEmpty { "mcd001.ps2" })
-        NativeApp.setSetting("MemoryCards", "Slot2_Enable", "bool", memoryCardSlot2Enabled.toString())
-        NativeApp.setSetting("MemoryCards", "Slot2_Filename", "string", memoryCardSlot2Filename.ifEmpty { "mcd002.ps2" })
+        put("DEV9/Eth", "EthEnable", "bool", dev9EthEnable.toString())
+        put("DEV9/Eth", "EthApi", "string", dev9EthApi)
+        put("DEV9/Eth", "EthDevice", "string", dev9EthDevice.ifEmpty { "Auto" })
+        put("DEV9/Eth", "EthLogDHCP", "bool", dev9EthLogDhcp.toString())
+        put("DEV9/Eth", "EthLogDNS", "bool", dev9EthLogDns.toString())
+        put("DEV9/Eth", "InterceptDHCP", "bool", dev9InterceptDhcp.toString())
+        put("DEV9/Eth", "PS2IP", "string", dev9Ps2Ip.ifEmpty { "0.0.0.0" })
+        put("DEV9/Eth", "Mask", "string", dev9Mask.ifEmpty { "0.0.0.0" })
+        put("DEV9/Eth", "Gateway", "string", dev9Gateway.ifEmpty { "0.0.0.0" })
+        put("DEV9/Eth", "DNS1", "string", dev9Dns1.ifEmpty { "0.0.0.0" })
+        put("DEV9/Eth", "DNS2", "string", dev9Dns2.ifEmpty { "0.0.0.0" })
+        put("DEV9/Eth", "AutoMask", "bool", dev9AutoMask.toString())
+        put("DEV9/Eth", "AutoGateway", "bool", dev9AutoGateway.toString())
+        put("DEV9/Eth", "ModeDNS1", "string", dev9ModeDns1.ifEmpty { "Auto" })
+        put("DEV9/Eth", "ModeDNS2", "string", dev9ModeDns2.ifEmpty { "Auto" })
+        put("DEV9/Hdd", "HddEnable", "bool", dev9HddEnable.toString())
+        put("DEV9/Hdd", "HddFile", "string", dev9HddFile.ifEmpty { "DEV9hdd.raw" })
+        put("MemoryCards", "Slot1_Enable", "bool", memoryCardSlot1Enabled.toString())
+        put("MemoryCards", "Slot1_Filename", "string", memoryCardSlot1Filename.ifEmpty { "mcd001.ps2" })
+        put("MemoryCards", "Slot2_Enable", "bool", memoryCardSlot2Enabled.toString())
+        put("MemoryCards", "Slot2_Filename", "string", memoryCardSlot2Filename.ifEmpty { "mcd002.ps2" })
         // Recompiler enables. Picked up by VMManager::ApplySettings →
         // SysCpuProviderPack rebind. Toggling these on a running VM swaps
         // the dispatch pointer; existing JIT block caches are flushed by
         // ApplySettings's CpusChanged path.
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "EnableEE", "bool", recEE.toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "EnableIOP", "bool", recIOP.toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "EnableVU0", "bool", recVU0.toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "EnableVU1", "bool", recVU1.toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "EnableFastmem", "bool", enableFastmem.toString())
+        put("EmuCore/CPU/Recompiler", "EnableEE", "bool", recEE.toString())
+        put("EmuCore/CPU/Recompiler", "EnableIOP", "bool", recIOP.toString())
+        put("EmuCore/CPU/Recompiler", "EnableVU0", "bool", recVU0.toString())
+        put("EmuCore/CPU/Recompiler", "EnableVU1", "bool", recVU1.toString())
+        put("EmuCore/CPU/Recompiler", "EnableFastmem", "bool", enableFastmem.toString())
         // Force the single macOS/PCSX2 ARM64 backend. VMManager also ignores
         // stale UseMac* values, but writing true cleans old persisted settings.
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "UseMacEE", "bool", "true")
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "UseMacIOP", "bool", "true")
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "UseMacVU0", "bool", "true")
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "UseMacVU1", "bool", "true")
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "Vu1InlineFmacStall", "bool", vu1InlineFmacStall.toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "Vu1CrossBlockPState", "bool", vu1CrossBlockPState.toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "Vu1InlineDrainTestPipes", "bool", vu1InlineDrainTestPipes.toString())
-        NativeApp.setSetting("EmuCore/CPU/Recompiler", "Vu1FmacInstanceRouting", "bool", vu1FmacInstanceRouting.toString())
+        put("EmuCore/CPU/Recompiler", "UseMacEE", "bool", "true")
+        put("EmuCore/CPU/Recompiler", "UseMacIOP", "bool", "true")
+        put("EmuCore/CPU/Recompiler", "UseMacVU0", "bool", "true")
+        put("EmuCore/CPU/Recompiler", "UseMacVU1", "bool", "true")
+        put("EmuCore/CPU/Recompiler", "Vu1InlineFmacStall", "bool", vu1InlineFmacStall.toString())
+        put("EmuCore/CPU/Recompiler", "Vu1CrossBlockPState", "bool", vu1CrossBlockPState.toString())
+        put("EmuCore/CPU/Recompiler", "Vu1InlineDrainTestPipes", "bool", vu1InlineDrainTestPipes.toString())
+        put("EmuCore/CPU/Recompiler", "Vu1FmacInstanceRouting", "bool", vu1FmacInstanceRouting.toString())
         writeGsToNative()
+        // Per-game INI export is capturing the key set only — writeGsToNative()
+        // above was the last persisted emit, so stop before the live pokes /
+        // commit (they'd re-poke the VM and double-park it; the export must not).
+        if (emitSink != null) return
         // Live convenience pokes. Harmless when the GS is closed; commitSettings()
         // below performs the authoritative apply for a cold start / restart.
         NativeApp.setAspectRatio(aspectRatio.coerceIn(0, 4))
@@ -563,7 +634,42 @@ data class Settings(
         NativeApp.osdShowResolution(osdShowResolution)
         NativeApp.osdShowGSStats(osdShowGsStats)
         NativeApp.osdShowFrameTimes(osdShowFrameTimes)
+        NativeApp.osdShowHardwareInfo(osdShowHardwareInfo)
+        NativeApp.osdShowVersion(osdShowVersion)
         NativeApp.commitSettings()
+    }
+
+    /** Upstream-style per-game export (mirrors PCSX2's FullscreenUI): write only
+     *  the keys that differ from [global] into the running game's
+     *  gamesettings/<serial>_<CRC>.ini, so the on-disk layer is sparse and
+     *  portable (a later global tweak still reaches the game for keys it didn't
+     *  override). Reuses applyTo's exact field→key mapping via [emitSink]: the
+     *  global pass captures a baseline, the effective pass writes the diff. The
+     *  running game already reflects the change live, so the native commit does
+     *  not reload — the INI applies as the game layer on the next boot. No-op
+     *  when no VM is running. */
+    fun writeGameSettingsIni(global: Settings) {
+        // Baseline: global's persisted keys. applyTo early-returns before the
+        // live pokes/commit while emitSink is set, so nothing touches the VM.
+        val baseline = HashMap<String, String>()
+        emitSink = { section, key, _, value -> baseline["$section$key"] = value }
+        try {
+            global.applyTo()
+        } finally {
+            emitSink = null
+        }
+        if (!NativeApp.gameIniBeginWrite()) return
+        // Effective pass: stream only the keys that differ from the baseline.
+        emitSink = { section, key, _, value ->
+            if (baseline["$section$key"] != value)
+                NativeApp.gameIniPut(section, key, value)
+        }
+        try {
+            applyTo()
+        } finally {
+            emitSink = null
+        }
+        NativeApp.gameIniCommitWrite()
     }
 
     /** Writes every EmuCore/GS key (display + renderer + hardware/upscaling
@@ -579,99 +685,107 @@ data class Settings(
             4 -> "10:7"
             else -> "Auto 4:3/3:2"
         }
-        NativeApp.setSetting("EmuCore/GS", "AspectRatio", "string", aspectRatioName)
-        NativeApp.setSetting("EmuCore/GS", "deinterlace_mode", "int", deinterlaceMode.coerceIn(0, 9).toString())
-        NativeApp.setSetting("EmuCore/GS", "hw_mipmap", "bool", hwMipmap.toString())
-        NativeApp.setSetting("EmuCore/GS", "accurate_blending_unit", "int", accurateBlendingUnit.toString())
-        NativeApp.setSetting("EmuCore/GS", "filter", "int", textureFiltering.toString())
-        NativeApp.setSetting("EmuCore/GS", "texture_preloading", "int", texturePreloading.toString())
-        NativeApp.setSetting("EmuCore/GS", "HWDownloadMode", "int", hardwareDownloadMode.coerceIn(0, 4).toString())
-        NativeApp.setSetting("EmuCore/GS", "TVShader", "int", tvShader.coerceIn(0, 7).toString())
-        NativeApp.setSetting("EmuCore/GS", "ShadeBoost", "bool", shadeBoost.toString())
-        NativeApp.setSetting("EmuCore/GS", "ShadeBoost_Brightness", "int", shadeBoostBrightness.coerceIn(1, 100).toString())
-        NativeApp.setSetting("EmuCore/GS", "ShadeBoost_Contrast", "int", shadeBoostContrast.coerceIn(1, 100).toString())
-        NativeApp.setSetting("EmuCore/GS", "ShadeBoost_Saturation", "int", shadeBoostSaturation.coerceIn(1, 100).toString())
-        NativeApp.setSetting("EmuCore/GS", "ShadeBoost_Gamma", "int", shadeBoostGamma.coerceIn(1, 100).toString())
-        NativeApp.setSetting("EmuCore/GS", "LoadTextureReplacements", "bool", loadTextureReplacements.toString())
-        NativeApp.setSetting("EmuCore/GS", "LoadTextureReplacementsAsync", "bool", loadTextureReplacementsAsync.toString())
-        NativeApp.setSetting("EmuCore/GS", "PrecacheTextureReplacements", "bool", precacheTextureReplacements.toString())
-        NativeApp.setSetting("EmuCore/GS", "DumpReplaceableTextures", "bool", dumpReplaceableTextures.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowTextureReplacements", "bool", osdShowTextureReplacements.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowFPS", "bool", osdShowFps.toString())
-        NativeApp.setSetting("EmuCore/GS", "VsyncEnable", "bool", vsyncEnable.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowVPS", "bool", osdShowVps.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowSpeed", "bool", osdShowSpeed.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowCPU", "bool", osdShowCpu.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowGPU", "bool", osdShowGpu.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowResolution", "bool", osdShowResolution.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowGSStats", "bool", osdShowGsStats.toString())
-        NativeApp.setSetting("EmuCore/GS", "OsdShowFrameTimes", "bool", osdShowFrameTimes.toString())
+        put("EmuCore/GS", "AspectRatio", "string", aspectRatioName)
+        put("EmuCore/GS", "deinterlace_mode", "int", deinterlaceMode.coerceIn(0, 9).toString())
+        put("EmuCore/GS", "FramerateNTSC", "float", framerateNtsc.toString())
+        put("EmuCore/GS", "FrameratePAL", "float", frameratePal.toString())
+        put("EmuCore/GS", "hw_mipmap", "bool", hwMipmap.toString())
+        put("EmuCore/GS", "accurate_blending_unit", "int", accurateBlendingUnit.toString())
+        put("EmuCore/GS", "filter", "int", textureFiltering.toString())
+        put("EmuCore/GS", "texture_preloading", "int", texturePreloading.toString())
+        put("EmuCore/GS", "HWDownloadMode", "int", hardwareDownloadMode.coerceIn(0, 4).toString())
+        put("EmuCore/GS", "TVShader", "int", tvShader.coerceIn(0, 7).toString())
+        put("EmuCore/GS", "ShadeBoost", "bool", shadeBoost.toString())
+        put("EmuCore/GS", "ShadeBoost_Brightness", "int", shadeBoostBrightness.coerceIn(1, 100).toString())
+        put("EmuCore/GS", "ShadeBoost_Contrast", "int", shadeBoostContrast.coerceIn(1, 100).toString())
+        put("EmuCore/GS", "ShadeBoost_Saturation", "int", shadeBoostSaturation.coerceIn(1, 100).toString())
+        put("EmuCore/GS", "ShadeBoost_Gamma", "int", shadeBoostGamma.coerceIn(1, 100).toString())
+        put("EmuCore/GS", "LoadTextureReplacements", "bool", loadTextureReplacements.toString())
+        put("EmuCore/GS", "LoadTextureReplacementsAsync", "bool", loadTextureReplacementsAsync.toString())
+        put("EmuCore/GS", "PrecacheTextureReplacements", "bool", precacheTextureReplacements.toString())
+        put("EmuCore/GS", "DumpReplaceableTextures", "bool", dumpReplaceableTextures.toString())
+        put("EmuCore/GS", "OsdShowTextureReplacements", "bool", osdShowTextureReplacements.toString())
+        put("EmuCore/GS", "OsdShowFPS", "bool", osdShowFps.toString())
+        put("EmuCore/GS", "VsyncEnable", "bool", vsyncEnable.toString())
+        put("EmuCore/GS", "OsdShowVPS", "bool", osdShowVps.toString())
+        put("EmuCore/GS", "OsdShowSpeed", "bool", osdShowSpeed.toString())
+        put("EmuCore/GS", "OsdShowCPU", "bool", osdShowCpu.toString())
+        put("EmuCore/GS", "OsdShowGPU", "bool", osdShowGpu.toString())
+        put("EmuCore/GS", "OsdShowResolution", "bool", osdShowResolution.toString())
+        put("EmuCore/GS", "OsdShowGSStats", "bool", osdShowGsStats.toString())
+        put("EmuCore/GS", "OsdShowFrameTimes", "bool", osdShowFrameTimes.toString())
+        put("EmuCore/GS", "OsdShowHardwareInfo", "bool", osdShowHardwareInfo.toString())
+        put("EmuCore/GS", "OsdShowVersion", "bool", osdShowVersion.toString())
         // Display / PCRTC fixes (not gated by the UserHacks master).
-        NativeApp.setSetting("EmuCore/GS", "pcrtc_offsets", "bool", screenOffsets.toString())
-        NativeApp.setSetting("EmuCore/GS", "pcrtc_overscan", "bool", showOverscan.toString())
-        NativeApp.setSetting("EmuCore/GS", "pcrtc_antiblur", "bool", antiBlur.toString())
-        NativeApp.setSetting("EmuCore/GS", "disable_interlace_offset", "bool", disableInterlaceOffset.toString())
-        NativeApp.setSetting("EmuCore/GS", "SyncToHostRefreshRate", "bool", syncToHostRefresh.toString())
-        NativeApp.setSetting("EmuCore/GS", "DisableFramebufferFetch", "bool", disableFramebufferFetch.toString())
-        NativeApp.setSetting("EmuCore/GS", "OverrideTextureBarriers", "int", overrideTextureBarriers.coerceIn(-1, 1).toString())
-        NativeApp.setSetting("EmuCore/GS", "DisableVertexShaderExpand", "bool", disableVertexShaderExpand.toString())
-        NativeApp.setSetting("EmuCore/GS", "UseBlitSwapChain", "bool", useBlitSwapChain.toString())
-        NativeApp.setSetting("EmuCore/GS", "DisableShaderCache", "bool", disableShaderCache.toString())
-        NativeApp.setSetting("EmuCore/GS", "HWAccurateAlphaTest", "bool", hwAccurateAlphaTest.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_DrawBuffering", "bool", drawBuffering.toString())
-        NativeApp.setSetting("EmuCore/GS", "HWSpinGPUForReadbacks", "bool", spinGpuReadbacks.toString())
-        NativeApp.setSetting("EmuCore/GS", "HWSpinCPUForReadbacks", "bool", spinCpuReadbacks.toString())
-        NativeApp.setSetting("EmuCore/GS", "IntegerScaling", "bool", integerScaling.toString())
-        NativeApp.setSetting("EmuCore/GS", "dithering_ps2", "int", dithering.coerceIn(0, 2).toString())
-        NativeApp.setSetting("EmuCore/GS", "VsyncQueueSize", "int", vsyncQueueSize.coerceIn(0, 3).toString())
-        NativeApp.setSetting("EmuCore/GS", "autoflush_sw", "bool", autoFlushSw.toString())
-        NativeApp.setSetting("EmuCore/GS", "mipmap", "bool", mipmapSw.toString())
-        NativeApp.setSetting("EmuCore/GS", "extrathreads", "int", swThreads.coerceIn(0, 10).toString())
-        NativeApp.setSetting("EmuCore/GS", "extrathreads_height", "int", swThreadsHeight.coerceIn(0, 8).toString())
+        put("EmuCore/GS", "pcrtc_offsets", "bool", screenOffsets.toString())
+        put("EmuCore/GS", "pcrtc_overscan", "bool", showOverscan.toString())
+        put("EmuCore/GS", "pcrtc_antiblur", "bool", antiBlur.toString())
+        put("EmuCore/GS", "disable_interlace_offset", "bool", disableInterlaceOffset.toString())
+        put("EmuCore/GS", "SyncToHostRefreshRate", "bool", syncToHostRefresh.toString())
+        put("EmuCore/GS", "DisableFramebufferFetch", "bool", disableFramebufferFetch.toString())
+        put("EmuCore/GS", "HWROV", "bool", hwRov.toString())
+        put("EmuCore/GS", "HWAA1", "bool", hwAa1.toString())
+        put("EmuCore/GS", "HWAccurateAlphaTest", "bool", hwAat.toString())
+        put("EmuCore/GS", "EnableAdrenoFramebufferFetch", "bool", adrenoFbFetch.toString())
+        put("EmuCore/GS", "OverrideTextureBarriers", "int", overrideTextureBarriers.coerceIn(-1, 1).toString())
+        put("EmuCore/GS", "DisableVertexShaderExpand", "bool", disableVertexShaderExpand.toString())
+        put("EmuCore/GS", "UseBlitSwapChain", "bool", useBlitSwapChain.toString())
+        put("EmuCore/GS", "DisableShaderCache", "bool", disableShaderCache.toString())
+        put("EmuCore/GS", "HWAccurateAlphaTest", "bool", hwAccurateAlphaTest.toString())
+        put("EmuCore/GS", "UserHacks_DrawBuffering", "bool", drawBuffering.toString())
+        put("EmuCore/GS", "HWSpinGPUForReadbacks", "bool", spinGpuReadbacks.toString())
+        put("EmuCore/GS", "HWSpinCPUForReadbacks", "bool", spinCpuReadbacks.toString())
+        put("EmuCore/GS", "IntegerScaling", "bool", integerScaling.toString())
+        put("EmuCore/GS", "dithering_ps2", "int", dithering.coerceIn(0, 2).toString())
+        put("EmuCore/GS", "VsyncQueueSize", "int", vsyncQueueSize.coerceIn(0, 3).toString())
+        put("EmuCore/GS", "autoflush_sw", "bool", autoFlushSw.toString())
+        put("EmuCore/GS", "mipmap", "bool", mipmapSw.toString())
+        put("EmuCore/GS", "extrathreads", "int", swThreads.coerceIn(0, 10).toString())
+        put("EmuCore/GS", "extrathreads_height", "int", swThreadsHeight.coerceIn(0, 8).toString())
         // Skip-draw is a UserHack (gated by the master toggle below).
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_SkipDraw_Start", "int", skipDrawStart.coerceAtLeast(0).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_SkipDraw_End", "int", skipDrawEnd.coerceAtLeast(0).toString())
+        put("EmuCore/GS", "UserHacks_SkipDraw_Start", "int", skipDrawStart.coerceAtLeast(0).toString())
+        put("EmuCore/GS", "UserHacks_SkipDraw_End", "int", skipDrawEnd.coerceAtLeast(0).toString())
         // Master hardware-fixes toggle. Auto-enables when ANY individual hack is
         // non-default so the user doesn't have to flip it; PCSX2 masks every
         // UserHacks_* key when this is off (GSOptions::MaskUserHacks).
-        NativeApp.setSetting("EmuCore/GS", "UserHacks", "bool", anyUserHackEnabled().toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_AutoFlushLevel", "int", autoFlush.coerceIn(0, 2).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_HalfPixelOffset", "int", halfPixelOffset.coerceIn(0, 5).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_Limit24BitDepth", "int", limit24BitDepth.coerceIn(0, 2).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_TextureInsideRt", "int", textureInsideRt.coerceIn(0, 2).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_native_scaling", "int", nativeScaling.coerceIn(0, 4).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_round_sprite_offset", "int", roundSprite.coerceIn(0, 2).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_BilinearHack", "int", bilinearUpscale.coerceIn(0, 3).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_GPUTargetCLUTMode", "int", gpuTargetClut.coerceIn(0, 2).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_CPUSpriteRenderBW", "int", cpuSpriteRenderBw.coerceIn(0, 3).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_CPUSpriteRenderLevel", "int", cpuSpriteRenderLevel.coerceIn(0, 5).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_CPUCLUTRender", "int", cpuClutRender.coerceIn(0, 2).toString())
+        put("EmuCore/GS", "UserHacks", "bool", anyUserHackEnabled().toString())
+        put("EmuCore/GS", "UserHacks_AutoFlushLevel", "int", autoFlush.coerceIn(0, 2).toString())
+        put("EmuCore/GS", "UserHacks_HalfPixelOffset", "int", halfPixelOffset.coerceIn(0, 5).toString())
+        put("EmuCore/GS", "UserHacks_Limit24BitDepth", "int", limit24BitDepth.coerceIn(0, 2).toString())
+        put("EmuCore/GS", "UserHacks_TextureInsideRt", "int", textureInsideRt.coerceIn(0, 2).toString())
+        put("EmuCore/GS", "UserHacks_native_scaling", "int", nativeScaling.coerceIn(0, 4).toString())
+        put("EmuCore/GS", "UserHacks_round_sprite_offset", "int", roundSprite.coerceIn(0, 2).toString())
+        put("EmuCore/GS", "UserHacks_BilinearHack", "int", bilinearUpscale.coerceIn(0, 3).toString())
+        put("EmuCore/GS", "UserHacks_GPUTargetCLUTMode", "int", gpuTargetClut.coerceIn(0, 2).toString())
+        put("EmuCore/GS", "UserHacks_CPUSpriteRenderBW", "int", cpuSpriteRenderBw.coerceIn(0, 3).toString())
+        put("EmuCore/GS", "UserHacks_CPUSpriteRenderLevel", "int", cpuSpriteRenderLevel.coerceIn(0, 5).toString())
+        put("EmuCore/GS", "UserHacks_CPUCLUTRender", "int", cpuClutRender.coerceIn(0, 2).toString())
         // Upscaling fixes (parity additions)
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_align_sprite_X", "bool", alignSprite.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_merge_pp_sprite", "bool", mergeSprite.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_ForceEvenSpritePosition", "bool", forceEvenSpritePosition.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_NativePaletteDraw", "bool", unscaledPaletteDraw.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_TCOffsetX", "int", textureOffsetX.coerceIn(0, 10000).toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_TCOffsetY", "int", textureOffsetY.coerceIn(0, 10000).toString())
+        put("EmuCore/GS", "UserHacks_align_sprite_X", "bool", alignSprite.toString())
+        put("EmuCore/GS", "UserHacks_merge_pp_sprite", "bool", mergeSprite.toString())
+        put("EmuCore/GS", "UserHacks_ForceEvenSpritePosition", "bool", forceEvenSpritePosition.toString())
+        put("EmuCore/GS", "UserHacks_NativePaletteDraw", "bool", unscaledPaletteDraw.toString())
+        put("EmuCore/GS", "UserHacks_TCOffsetX", "int", textureOffsetX.coerceIn(0, 10000).toString())
+        put("EmuCore/GS", "UserHacks_TCOffsetY", "int", textureOffsetY.coerceIn(0, 10000).toString())
         // Hardware fixes (parity additions)
-        NativeApp.setSetting("EmuCore/GS", "paltex", "bool", gpuPaletteConversion.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_CPU_FB_Conversion", "bool", cpuFramebufferConversion.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_ReadTCOnClose", "bool", readTargetsWhenClosing.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_DisableDepthSupport", "bool", disableDepthEmulation.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_DisablePartialInvalidation", "bool", disablePartialInvalidation.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_Disable_Safe_Features", "bool", disableSafeFeatures.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_DisableRenderFixes", "bool", disableRenderFixes.toString())
-        NativeApp.setSetting("EmuCore/GS", "preload_frame_with_gs_data", "bool", preloadFrameData.toString())
-        NativeApp.setSetting("EmuCore/GS", "UserHacks_EstimateTextureRegion", "bool", estimateTextureRegion.toString())
-        NativeApp.setSetting("EmuCore/GS", "TriFilter", "int", triFilter.toString())
-        NativeApp.setSetting("EmuCore/GS", "MaxAnisotropy", "int", maxAnisotropy.toString())
+        put("EmuCore/GS", "paltex", "bool", gpuPaletteConversion.toString())
+        put("EmuCore/GS", "UserHacks_CPU_FB_Conversion", "bool", cpuFramebufferConversion.toString())
+        put("EmuCore/GS", "UserHacks_ReadTCOnClose", "bool", readTargetsWhenClosing.toString())
+        put("EmuCore/GS", "UserHacks_DisableDepthSupport", "bool", disableDepthEmulation.toString())
+        put("EmuCore/GS", "UserHacks_DisablePartialInvalidation", "bool", disablePartialInvalidation.toString())
+        put("EmuCore/GS", "UserHacks_Disable_Safe_Features", "bool", disableSafeFeatures.toString())
+        put("EmuCore/GS", "UserHacks_DisableRenderFixes", "bool", disableRenderFixes.toString())
+        put("EmuCore/GS", "preload_frame_with_gs_data", "bool", preloadFrameData.toString())
+        put("EmuCore/GS", "UserHacks_EstimateTextureRegion", "bool", estimateTextureRegion.toString())
+        put("EmuCore/GS", "TriFilter", "int", triFilter.toString())
+        put("EmuCore/GS", "MaxAnisotropy", "int", maxAnisotropy.toString())
         val gpuProfileStr = when (gpuProfile) {
             1 -> "mali"
             2 -> "adreno"
             3 -> "powervr"
             else -> "auto"
         }
-        NativeApp.setSetting("EmuCore/GS", "AndroidGpuProfileOverride", "string", gpuProfileStr)
+        put("EmuCore/GS", "AndroidGpuProfileOverride", "string", gpuProfileStr)
     }
 
     /** True when any hardware/upscaling fix is non-default — used to auto-enable
@@ -703,6 +817,12 @@ data class Settings(
      *  park when only non-GS settings (audio, frame limit, …) changed.
      *  Excludes display aspect (its own live setter) and gpuProfile (device-init
      *  only — needs a renderer restart). */
+    // NOTE: FramerateNTSC/PAL are intentionally NOT here — the generic GS live
+    // reconfigure (applyGSSettingsLive) doesn't recompute the vsync target. They
+    // get their OWN live path instead: applySafeLiveDelta routes a framerate change
+    // to LiveGsApplyQueue.applyFramerate → NativeApp.applyFramerateLive, which parks
+    // the VM and recomputes vsync. Keeping them out of here avoids a redundant
+    // (and park-free, thus ineffective) GS reconfigure for a framerate-only edit.
     fun gsDiffersFrom(other: Settings): Boolean =
         deinterlaceMode != other.deinterlaceMode ||
             textureFiltering != other.textureFiltering ||
@@ -772,11 +892,17 @@ data class Settings(
         put("audioBufferMs", audioBufferMs)
         put("audioOutputLatencyMs", audioOutputLatencyMs)
         put("audioFastForwardVolume", audioFastForwardVolume)
+        put("spu2NeonReverb", spu2NeonReverb)
+        put("renderer", renderer)
+        put("upscaleFloat", upscaleFloat.toDouble())
+        put("framerateNtsc", framerateNtsc.toDouble())
+        put("frameratePal", frameratePal.toDouble())
         put("enablePatches", enablePatches)
         put("enableCheats", enableCheats)
         put("enableWideScreenPatches", enableWideScreenPatches)
         put("enableNoInterlacingPatches", enableNoInterlacingPatches)
         put("enableFastBoot", enableFastBoot)
+        put("hostFs", hostFs)
         put("enableGameFixes", enableGameFixes)
         put("gamefixSoftwareRendererFmv", gamefixSoftwareRendererFmv)
         put("gamefixSkipMpeg", gamefixSkipMpeg)
@@ -805,6 +931,10 @@ data class Settings(
         put("disableInterlaceOffset", disableInterlaceOffset)
         put("syncToHostRefresh", syncToHostRefresh)
         put("disableFramebufferFetch", disableFramebufferFetch)
+        put("hwRov", hwRov)
+        put("hwAa1", hwAa1)
+        put("hwAat", hwAat)
+        put("adrenoFbFetch", adrenoFbFetch)
         put("overrideTextureBarriers", overrideTextureBarriers)
         put("disableVertexShaderExpand", disableVertexShaderExpand)
         put("useBlitSwapChain", useBlitSwapChain)
@@ -878,6 +1008,8 @@ data class Settings(
         put("osdShowResolution", osdShowResolution)
         put("osdShowGsStats", osdShowGsStats)
         put("osdShowFrameTimes", osdShowFrameTimes)
+        put("osdShowHardwareInfo", osdShowHardwareInfo)
+        put("osdShowVersion", osdShowVersion)
         put("autoFlush", autoFlush)
         put("halfPixelOffset", halfPixelOffset)
         put("limit24BitDepth", limit24BitDepth)
@@ -912,6 +1044,13 @@ data class Settings(
     }
 
     companion object {
+        /** When non-null, [put] routes persisted-key emits here instead of the
+         *  native base layer. Set transiently by [writeGameSettingsIni] to
+         *  capture the key set for the sparse per-game INI export without
+         *  touching the base layer or re-poking the running VM. */
+        @JvmStatic
+        internal var emitSink: ((String, String, String, String) -> Unit)? = null
+
         /** Lenient parse — missing keys fall back to defaults so old saved
          *  blobs survive when new fields are added. */
         fun fromJson(json: JSONObject): Settings {
@@ -940,11 +1079,17 @@ data class Settings(
                 audioBufferMs = json.optInt("audioBufferMs", def.audioBufferMs),
                 audioOutputLatencyMs = json.optInt("audioOutputLatencyMs", def.audioOutputLatencyMs),
                 audioFastForwardVolume = json.optInt("audioFastForwardVolume", def.audioFastForwardVolume),
+                spu2NeonReverb = json.optBoolean("spu2NeonReverb", def.spu2NeonReverb),
+                renderer = json.optString("renderer", def.renderer),
+                upscaleFloat = json.optDouble("upscaleFloat", def.upscaleFloat.toDouble()).toFloat(),
+                framerateNtsc = json.optDouble("framerateNtsc", def.framerateNtsc.toDouble()).toFloat(),
+                frameratePal = json.optDouble("frameratePal", def.frameratePal.toDouble()).toFloat(),
                 enablePatches = json.optBoolean("enablePatches", def.enablePatches),
                 enableCheats = json.optBoolean("enableCheats", def.enableCheats),
                 enableWideScreenPatches = json.optBoolean("enableWideScreenPatches", def.enableWideScreenPatches),
                 enableNoInterlacingPatches = json.optBoolean("enableNoInterlacingPatches", def.enableNoInterlacingPatches),
                 enableFastBoot = json.optBoolean("enableFastBoot", def.enableFastBoot),
+                hostFs = json.optBoolean("hostFs", def.hostFs),
                 enableGameFixes = json.optBoolean("enableGameFixes", def.enableGameFixes),
                 gamefixSoftwareRendererFmv = json.optBoolean("gamefixSoftwareRendererFmv", def.gamefixSoftwareRendererFmv),
                 gamefixSkipMpeg = json.optBoolean("gamefixSkipMpeg", def.gamefixSkipMpeg),
@@ -973,6 +1118,10 @@ data class Settings(
                 disableInterlaceOffset = json.optBoolean("disableInterlaceOffset", def.disableInterlaceOffset),
                 syncToHostRefresh = json.optBoolean("syncToHostRefresh", def.syncToHostRefresh),
                 disableFramebufferFetch = json.optBoolean("disableFramebufferFetch", def.disableFramebufferFetch),
+                hwRov = json.optBoolean("hwRov", def.hwRov),
+                hwAa1 = json.optBoolean("hwAa1", def.hwAa1),
+                hwAat = json.optBoolean("hwAat", def.hwAat),
+                adrenoFbFetch = json.optBoolean("adrenoFbFetch", def.adrenoFbFetch),
                 overrideTextureBarriers = json.optInt("overrideTextureBarriers", def.overrideTextureBarriers),
                 disableVertexShaderExpand = json.optBoolean("disableVertexShaderExpand", def.disableVertexShaderExpand),
                 useBlitSwapChain = json.optBoolean("useBlitSwapChain", def.useBlitSwapChain),
@@ -1050,6 +1199,8 @@ data class Settings(
                 osdShowResolution = json.optBoolean("osdShowResolution", def.osdShowResolution),
                 osdShowGsStats = json.optBoolean("osdShowGsStats", def.osdShowGsStats),
                 osdShowFrameTimes = json.optBoolean("osdShowFrameTimes", def.osdShowFrameTimes),
+                osdShowHardwareInfo = json.optBoolean("osdShowHardwareInfo", def.osdShowHardwareInfo),
+                osdShowVersion = json.optBoolean("osdShowVersion", def.osdShowVersion),
                 autoFlush = json.optInt("autoFlush", def.autoFlush),
                 halfPixelOffset = json.optInt("halfPixelOffset", def.halfPixelOffset),
                 limit24BitDepth = json.optInt("limit24BitDepth", def.limit24BitDepth),
@@ -1118,11 +1269,17 @@ data class Settings(
             if (current.audioBufferMs != base.audioBufferMs) j.put("audioBufferMs", current.audioBufferMs)
             if (current.audioOutputLatencyMs != base.audioOutputLatencyMs) j.put("audioOutputLatencyMs", current.audioOutputLatencyMs)
             if (current.audioFastForwardVolume != base.audioFastForwardVolume) j.put("audioFastForwardVolume", current.audioFastForwardVolume)
+            if (current.spu2NeonReverb != base.spu2NeonReverb) j.put("spu2NeonReverb", current.spu2NeonReverb)
+            if (current.renderer != base.renderer) j.put("renderer", current.renderer)
+            if (current.upscaleFloat != base.upscaleFloat) j.put("upscaleFloat", current.upscaleFloat.toDouble())
+            if (current.framerateNtsc != base.framerateNtsc) j.put("framerateNtsc", current.framerateNtsc.toDouble())
+            if (current.frameratePal != base.frameratePal) j.put("frameratePal", current.frameratePal.toDouble())
             if (current.enablePatches != base.enablePatches) j.put("enablePatches", current.enablePatches)
             if (current.enableCheats != base.enableCheats) j.put("enableCheats", current.enableCheats)
             if (current.enableWideScreenPatches != base.enableWideScreenPatches) j.put("enableWideScreenPatches", current.enableWideScreenPatches)
             if (current.enableNoInterlacingPatches != base.enableNoInterlacingPatches) j.put("enableNoInterlacingPatches", current.enableNoInterlacingPatches)
             if (current.enableFastBoot != base.enableFastBoot) j.put("enableFastBoot", current.enableFastBoot)
+            if (current.hostFs != base.hostFs) j.put("hostFs", current.hostFs)
             if (current.enableGameFixes != base.enableGameFixes) j.put("enableGameFixes", current.enableGameFixes)
             if (current.gamefixSoftwareRendererFmv != base.gamefixSoftwareRendererFmv) j.put("gamefixSoftwareRendererFmv", current.gamefixSoftwareRendererFmv)
             if (current.gamefixSkipMpeg != base.gamefixSkipMpeg) j.put("gamefixSkipMpeg", current.gamefixSkipMpeg)
@@ -1151,6 +1308,10 @@ data class Settings(
             if (current.disableInterlaceOffset != base.disableInterlaceOffset) j.put("disableInterlaceOffset", current.disableInterlaceOffset)
             if (current.syncToHostRefresh    != base.syncToHostRefresh)    j.put("syncToHostRefresh", current.syncToHostRefresh)
             if (current.disableFramebufferFetch != base.disableFramebufferFetch) j.put("disableFramebufferFetch", current.disableFramebufferFetch)
+            if (current.hwRov != base.hwRov) j.put("hwRov", current.hwRov)
+            if (current.hwAa1 != base.hwAa1) j.put("hwAa1", current.hwAa1)
+            if (current.hwAat != base.hwAat) j.put("hwAat", current.hwAat)
+            if (current.adrenoFbFetch != base.adrenoFbFetch) j.put("adrenoFbFetch", current.adrenoFbFetch)
             if (current.overrideTextureBarriers != base.overrideTextureBarriers) j.put("overrideTextureBarriers", current.overrideTextureBarriers)
             if (current.disableVertexShaderExpand != base.disableVertexShaderExpand) j.put("disableVertexShaderExpand", current.disableVertexShaderExpand)
             if (current.useBlitSwapChain     != base.useBlitSwapChain)     j.put("useBlitSwapChain", current.useBlitSwapChain)
@@ -1224,6 +1385,8 @@ data class Settings(
             if (current.osdShowResolution != base.osdShowResolution) j.put("osdShowResolution", current.osdShowResolution)
             if (current.osdShowGsStats != base.osdShowGsStats) j.put("osdShowGsStats", current.osdShowGsStats)
             if (current.osdShowFrameTimes != base.osdShowFrameTimes) j.put("osdShowFrameTimes", current.osdShowFrameTimes)
+            if (current.osdShowHardwareInfo != base.osdShowHardwareInfo) j.put("osdShowHardwareInfo", current.osdShowHardwareInfo)
+            if (current.osdShowVersion != base.osdShowVersion) j.put("osdShowVersion", current.osdShowVersion)
             if (current.autoFlush           != base.autoFlush)           j.put("autoFlush", current.autoFlush)
             if (current.halfPixelOffset     != base.halfPixelOffset)     j.put("halfPixelOffset", current.halfPixelOffset)
             if (current.limit24BitDepth     != base.limit24BitDepth)     j.put("limit24BitDepth", current.limit24BitDepth)
@@ -1282,11 +1445,17 @@ data class Settings(
             audioBufferMs = if (overrides.has("audioBufferMs")) overrides.getInt("audioBufferMs") else base.audioBufferMs,
             audioOutputLatencyMs = if (overrides.has("audioOutputLatencyMs")) overrides.getInt("audioOutputLatencyMs") else base.audioOutputLatencyMs,
             audioFastForwardVolume = if (overrides.has("audioFastForwardVolume")) overrides.getInt("audioFastForwardVolume") else base.audioFastForwardVolume,
+            spu2NeonReverb = if (overrides.has("spu2NeonReverb")) overrides.getBoolean("spu2NeonReverb") else base.spu2NeonReverb,
+            renderer = if (overrides.has("renderer")) overrides.getString("renderer") else base.renderer,
+            upscaleFloat = if (overrides.has("upscaleFloat")) overrides.getDouble("upscaleFloat").toFloat() else base.upscaleFloat,
+            framerateNtsc = if (overrides.has("framerateNtsc")) overrides.getDouble("framerateNtsc").toFloat() else base.framerateNtsc,
+            frameratePal = if (overrides.has("frameratePal")) overrides.getDouble("frameratePal").toFloat() else base.frameratePal,
             enablePatches = if (overrides.has("enablePatches")) overrides.getBoolean("enablePatches") else base.enablePatches,
             enableCheats = if (overrides.has("enableCheats")) overrides.getBoolean("enableCheats") else base.enableCheats,
             enableWideScreenPatches = if (overrides.has("enableWideScreenPatches")) overrides.getBoolean("enableWideScreenPatches") else base.enableWideScreenPatches,
             enableNoInterlacingPatches = if (overrides.has("enableNoInterlacingPatches")) overrides.getBoolean("enableNoInterlacingPatches") else base.enableNoInterlacingPatches,
             enableFastBoot = if (overrides.has("enableFastBoot")) overrides.getBoolean("enableFastBoot") else base.enableFastBoot,
+            hostFs = if (overrides.has("hostFs")) overrides.getBoolean("hostFs") else base.hostFs,
             enableGameFixes = if (overrides.has("enableGameFixes")) overrides.getBoolean("enableGameFixes") else base.enableGameFixes,
             gamefixSoftwareRendererFmv = if (overrides.has("gamefixSoftwareRendererFmv")) overrides.getBoolean("gamefixSoftwareRendererFmv") else base.gamefixSoftwareRendererFmv,
             gamefixSkipMpeg = if (overrides.has("gamefixSkipMpeg")) overrides.getBoolean("gamefixSkipMpeg") else base.gamefixSkipMpeg,
@@ -1315,6 +1484,10 @@ data class Settings(
             disableInterlaceOffset = if (overrides.has("disableInterlaceOffset")) overrides.getBoolean("disableInterlaceOffset") else base.disableInterlaceOffset,
             syncToHostRefresh = if (overrides.has("syncToHostRefresh")) overrides.getBoolean("syncToHostRefresh") else base.syncToHostRefresh,
             disableFramebufferFetch = if (overrides.has("disableFramebufferFetch")) overrides.getBoolean("disableFramebufferFetch") else base.disableFramebufferFetch,
+            hwRov = if (overrides.has("hwRov")) overrides.getBoolean("hwRov") else base.hwRov,
+            hwAa1 = if (overrides.has("hwAa1")) overrides.getBoolean("hwAa1") else base.hwAa1,
+            hwAat = if (overrides.has("hwAat")) overrides.getBoolean("hwAat") else base.hwAat,
+            adrenoFbFetch = if (overrides.has("adrenoFbFetch")) overrides.getBoolean("adrenoFbFetch") else base.adrenoFbFetch,
             overrideTextureBarriers = if (overrides.has("overrideTextureBarriers")) overrides.getInt("overrideTextureBarriers") else base.overrideTextureBarriers,
             disableVertexShaderExpand = if (overrides.has("disableVertexShaderExpand")) overrides.getBoolean("disableVertexShaderExpand") else base.disableVertexShaderExpand,
             useBlitSwapChain = if (overrides.has("useBlitSwapChain")) overrides.getBoolean("useBlitSwapChain") else base.useBlitSwapChain,
@@ -1392,6 +1565,8 @@ data class Settings(
             osdShowResolution = if (overrides.has("osdShowResolution")) overrides.getBoolean("osdShowResolution") else base.osdShowResolution,
             osdShowGsStats = if (overrides.has("osdShowGsStats")) overrides.getBoolean("osdShowGsStats") else base.osdShowGsStats,
             osdShowFrameTimes = if (overrides.has("osdShowFrameTimes")) overrides.getBoolean("osdShowFrameTimes") else base.osdShowFrameTimes,
+            osdShowHardwareInfo = if (overrides.has("osdShowHardwareInfo")) overrides.getBoolean("osdShowHardwareInfo") else base.osdShowHardwareInfo,
+            osdShowVersion = if (overrides.has("osdShowVersion")) overrides.getBoolean("osdShowVersion") else base.osdShowVersion,
             autoFlush = if (overrides.has("autoFlush")) overrides.getInt("autoFlush") else base.autoFlush,
             halfPixelOffset = if (overrides.has("halfPixelOffset")) overrides.getInt("halfPixelOffset") else base.halfPixelOffset,
             limit24BitDepth = if (overrides.has("limit24BitDepth")) overrides.getInt("limit24BitDepth") else base.limit24BitDepth,

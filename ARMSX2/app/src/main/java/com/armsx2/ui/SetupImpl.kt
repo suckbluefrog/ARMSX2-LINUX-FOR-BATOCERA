@@ -3,7 +3,11 @@ package com.armsx2.ui
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.provider.Settings
+import com.armsx2.BuildConfig
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
@@ -16,7 +20,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -128,14 +135,32 @@ object SetupImpl {
     // -------- System dir setup state --------
     private val systemDirUri = mutableStateOf<Uri?>(null)
     private val systemDirDisplay = mutableStateOf<String?>(null)
-    /** Sentinel: user explicitly picked the app-private fallback instead
-     *  of a SAF folder. Treated as a valid "done" state for advancing
-     *  past the system-dir step on first-run. */
-    private val systemDirUseDefault = mutableStateOf(false)
+    /** Sentinel: the app-private fallback is the active system-dir choice
+     *  (vs. a SAF folder). Treated as a valid "done" state for advancing
+     *  past the system-dir step. DEFAULTS TRUE: app-private needs no
+     *  permission and is the only reliable writable root now that
+     *  MANAGE_EXTERNAL_STORAGE is gone (Play compliance). Without this,
+     *  a fresh first-run leaves appFolderReady()=false — and since a custom
+     *  folder now always fails the writability probe, "Let's Go" could never
+     *  enable, stranding new users on the setup screen. resetForReentry()
+     *  and a custom-folder pick override this as appropriate. */
+    private val systemDirUseDefault = mutableStateOf(true)
     /** Surface message shown on the system-dir page when validation fails
-     *  (typically scoped-storage write rejection on a non-app-private
-     *  folder without MANAGE_EXTERNAL_STORAGE). null = no error. */
+     *  (typically scoped-storage write rejection on a non-app-private folder).
+     *  null = no error. */
     private val systemDirError = mutableStateOf<String?>(null)
+
+    /** github (all-files) flavor only: the App-Data pick opens a small chooser
+     *  (Internal / SD / any folder) instead of going straight to SD. With
+     *  MANAGE_EXTERNAL_STORAGE granted, an arbitrary folder is raw-writable by
+     *  the core, so the existing write-probe in finishSystemDirStep accepts it.
+     *  Never shown on the play build (BuildConfig.STORAGE_ALL_FILES == false). */
+    private val showStorageChooser = mutableStateOf(false)
+
+    /** Set when the user changes the data-root (Internal<->SD) AFTER setup is
+     *  already complete. The native root is pinned per process, so we show a
+     *  confirm + restart the app rather than silently not applying the change. */
+    private val storageRestartPending = mutableStateOf(false)
 
     // -------- ROMs dirs setup state --------
     /** Working list of ROM-folder URIs while the wizard is open. Persists
@@ -152,6 +177,19 @@ object SetupImpl {
      *  the wizard forces an explicit GL/VK decision so the SW path knows
      *  which display backend to host the software frame on. */
     private val selectedRenderer = mutableStateOf<String?>(null)
+
+    // -------- Optional "Recommended Settings" step (first-run only) --------
+    // Shown as an OVERLAY after the core System/BIOS/ROMs setup completes on first
+    // run, before finishSetup — so it can NEVER re-block first-run (it's after the
+    // gate and fully skippable). PCSX2-wizard-style display/perf onboarding; choices
+    // default to the current global config and are written to global on "Finish".
+    private val showRecommended = mutableStateOf(false)
+    private val recAspect = mutableStateOf(1)        // 0 Stretch, 1 Auto, 2 4:3, 3 16:9, 4 10:7
+    private val recUpscale = mutableStateOf(1)       // internal-resolution multiplier 1..5
+    private val recAntiBlur = mutableStateOf(true)
+    private val recWidescreen = mutableStateOf(false)
+    private val recDeinterlaceOff = mutableStateOf(false) // false = Automatic, true = Off
+    private val recPerfFast = mutableStateOf(false)  // false = Optimal (safe), true = Fast
 
     // -------- Custom Vulkan driver state --------
     /** Active driver id (matches `CustomDriver.InstalledDriver.id`). null
@@ -198,12 +236,13 @@ object SetupImpl {
 
         val bios = scannedBioses.getOrNull(idx) ?: return null
 
-        // Write under the active data root (custom system folder when chosen,
-        // else app-private) so the BIOS lives alongside memcards/saves/configs
-        // instead of being pinned to app-private. assetCopyRoot resolves to the
-        // user's systemDir post-pick, which the setup already validated as
-        // writable; falls back to externalFilesDir otherwise.
-        val biosDir = File(Main.assetCopyRoot(context), "bios").apply { mkdirs() }
+        // Write to app-private internal storage, NOT the chosen data root. The
+        // native core can't reliably open a BIOS off a removable/SAF volume on
+        // Android 11+ (a data-root-on-SD setup then failed VM init and bounced
+        // back to the library), so the BIOS is decoupled from DataRoot and pinned
+        // internal — matching native-lib initialize()'s documented expectation.
+        // Memcards/saves/configs still follow the data root.
+        val biosDir = Main.internalBiosDir(context).apply { mkdirs() }
         val outFile = File(biosDir, bios.displayName)
 
         // Same-content fast-path: when the user re-entered setup and the
@@ -323,6 +362,12 @@ object SetupImpl {
         }
     }
 
+    /** True when the github build already holds All-Files Access (or is on an
+     *  older API where it isn't the gating model). Only meaningful on the
+     *  github flavor; the play build never reaches the all-files chooser. */
+    private fun allFilesAccessGranted(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+
     private fun finishSystemDirStep(context: Context): String? {
         // App-private fallback path. Wipe any prior systemDir pref so
         // NativeApp.initializeOnce → Main.systemDirPosix returns null and
@@ -350,31 +395,16 @@ object SetupImpl {
             return Main.systemDir.value
         }
 
-        // Validate POSIX writability BEFORE persisting. The SAF
-        // tree-URI grant lets us read, but emucore's FileSystem APIs
-        // hit raw fopen/mkdir which scoped storage rejects on
-        // Android 11+ unless MANAGE_EXTERNAL_STORAGE is granted.
-        // Without this gate, the wizard finishes happily, the user
-        // boots a game, and emucore SIGSEGVs trying to gen memcards
-        // / savestates / configs in a non-writable dir.
+        // Validate POSIX writability BEFORE persisting. The SAF tree-URI grant
+        // lets us read, but emucore's FileSystem APIs hit raw fopen/mkdir for
+        // memcards, savestates, configs, and shader data. On modern Android,
+        // those writes are only reliable in app-private storage unless the
+        // picked folder resolves to a real native-writable path.
         val posix = Main.resolveTreeUriToPosix(uri.toString())
-        if (posix != null && !Main.validateSystemDirWritable(posix)) {
-            // Auto-open the grant screen on Android 11+ so the user can
-            // toggle the permission with one tap. Activity.onResume will
-            // refresh allFilesAccessGranted; user re-clicks Next.
-            if (Main.needsAllFilesAccess()) {
-                Main.requestAllFilesAccess(context)
-                systemDirError.value = "Can't write to that folder. Grant " +
-                    "All Files Access (just opened in Settings), then tap Next again. " +
-                    "Or use the App-Private Folder option below."
-            } else {
-                // Permission already granted (or pre-Android-11) but the
-                // path still rejected writes — likely a removable / SD-
-                // card path the device doesn't surface as POSIX. Push
-                // the user to the fallback.
-                systemDirError.value = "That folder isn't writable from native code. " +
-                    "Pick a different folder or use the App-Private Folder option below."
-            }
+        if (posix == null || !Main.validateSystemDirWritable(posix)) {
+            systemDirError.value = "That folder can't be used for writable emulator data on this Android version. " +
+                "Use the App-Private Folder for memory cards, save states, and configs; " +
+                "game folders can still be added from SD card on the ROM folder step."
             return null
         }
 
@@ -494,20 +524,32 @@ object SetupImpl {
         configuredBiosInfo.value = if (existingBios != null) probeExistingBios(existingBios) else null
 
         val existingSystem = Main.systemDir.value
-        if (existingSystem != null) {
-            try {
-                val uri = Uri.parse(existingSystem)
-                systemDirUri.value = uri
-                systemDirDisplay.value = uri.lastPathSegment ?: existingSystem
-            } catch (_: Exception) {
+        when {
+            existingSystem == null -> {
                 systemDirUri.value = null
                 systemDirDisplay.value = null
+                systemDirUseDefault.value = true
             }
-        } else {
-            systemDirUri.value = null
-            systemDirDisplay.value = null
+            existingSystem.startsWith("content://") -> {
+                // Legacy SAF custom folder from an older build.
+                try {
+                    val uri = Uri.parse(existingSystem)
+                    systemDirUri.value = uri
+                    systemDirDisplay.value = uri.lastPathSegment ?: existingSystem
+                    systemDirUseDefault.value = false
+                } catch (_: Exception) {
+                    systemDirUri.value = null
+                    systemDirDisplay.value = null
+                    systemDirUseDefault.value = true
+                }
+            }
+            else -> {
+                // SD card app-specific absolute path (volume-choice model).
+                systemDirUri.value = null
+                systemDirDisplay.value = "SD Card"
+                systemDirUseDefault.value = false
+            }
         }
-        systemDirUseDefault.value = false
         systemDirError.value = null
 
         // Pre-load saved ROMs list. Each URI is parsed best-effort —
@@ -524,7 +566,7 @@ object SetupImpl {
     private fun pageTitle(): String = when (setupState.value) {
         0 -> "Welcome"
         1 -> "Choose renderer"
-        2 -> "Select system folder"
+        2 -> "System data folder"
         3 -> "Select your BIOS"
         4 -> "Select ROMs folder"
         else -> ""
@@ -532,7 +574,7 @@ object SetupImpl {
 
     /** Label for the page-local action button (in the nav row). null = no button. */
     private fun midButtonLabel(): String? = when (setupState.value) {
-        2 -> if (systemDirUri.value == null) "Pick System Folder" else "Pick a different folder"
+        2 -> if (systemDirUri.value == null) "Pick Custom Folder" else "Pick a different folder"
         // Use the URI presence (not the in-memory list) so the label says
         // "Pick a different folder" immediately on re-entry when we already
         // have a remembered biosDir, even before the auto-rescan finishes.
@@ -559,7 +601,52 @@ object SetupImpl {
             .putString("renderer", pick)
             .putString("customDriverId", driverId.orEmpty())
             .apply()
+        // Renderer now lives in the Settings tier (resolved by applyRendererPrefs).
+        // Mirror the wizard pick into the global config so it's honored, not just
+        // left in the legacy pref the one-time migration may have already passed.
+        runCatching {
+            com.armsx2.config.ConfigStore.saveGlobal(
+                com.armsx2.config.ConfigStore.loadGlobal().copy(renderer = pick)
+            )
+        }
         return pick
+    }
+
+    /** Pre-fill the Recommended Settings choices from the current global config so
+     *  the overlay shows the existing values (and "Skip" is a true no-op). */
+    private fun loadRecommendedFromGlobal() {
+        val g = com.armsx2.config.ConfigStore.loadGlobal()
+        // Seed the renderer tile from the current config (default Vulkan if it's
+        // auto/software) so the wizard shows a concrete OpenGL/Vulkan choice.
+        if (selectedRenderer.value == null)
+            selectedRenderer.value = if (g.renderer == "opengl") "opengl" else "vulkan"
+        recAspect.value = g.aspectRatio.coerceIn(0, 4)
+        recUpscale.value = g.upscaleFloat.toInt().coerceIn(1, 8)
+        recAntiBlur.value = g.antiBlur
+        recWidescreen.value = g.enableWideScreenPatches
+        recDeinterlaceOff.value = g.deinterlaceMode == 1 // 0 = Auto, 1 = Off
+        recPerfFast.value = g.eeCycleSkip >= 2 || g.fastCDVD
+    }
+
+    /** Write the Recommended Settings choices to the GLOBAL config tier. */
+    private fun finishRecommendedStep() {
+        runCatching {
+            val g = com.armsx2.config.ConfigStore.loadGlobal()
+            com.armsx2.config.ConfigStore.saveGlobal(
+                g.copy(
+                    aspectRatio = recAspect.value.coerceIn(0, 4),
+                    upscaleFloat = recUpscale.value.coerceIn(1, 8).toFloat(),
+                    antiBlur = recAntiBlur.value,
+                    enableWideScreenPatches = recWidescreen.value,
+                    deinterlaceMode = if (recDeinterlaceOff.value) 1 else 0,
+                    // Performance preset: Optimal (safe) vs Fast (aggressive) — mirrors
+                    // the in-game PerformanceTab Optimal/Fast snapshots.
+                    eeCycleRate = 0,
+                    eeCycleSkip = if (recPerfFast.value) 2 else 0,
+                    fastCDVD = recPerfFast.value,
+                )
+            )
+        }
     }
 
     /** Reusable PS2-blue button colors. */
@@ -574,26 +661,6 @@ object SetupImpl {
     @Composable
     fun SetupWindow() {
         val context = LocalContext.current
-        val systemLauncher = rememberLauncherForActivityResult(
-            contract = ActivityResultContracts.OpenDocumentTree()
-        ) { treeUri: Uri? ->
-            if (treeUri == null) return@rememberLauncherForActivityResult
-            // System folder needs read+write — emucore writes memcards,
-            // save states, and config there.
-            try {
-                context.contentResolver.takePersistableUriPermission(
-                    treeUri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            } catch (_: SecurityException) { /* already persisted */ }
-            systemDirUri.value = treeUri
-            systemDirDisplay.value = treeUri.lastPathSegment ?: treeUri.toString()
-            // Picking a fresh folder cancels the app-private opt-in and
-            // clears any prior validation error so the user gets a fresh
-            // shot at the writability probe on Next.
-            systemDirUseDefault.value = false
-            systemDirError.value = null
-            refreshAllowNext()
-        }
         val biosLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocumentTree()
         ) { treeUri: Uri? ->
@@ -630,6 +697,91 @@ object SetupImpl {
                 }
                 refreshAllowNext()
             }
+        }
+
+        // github (all-files) only: pick ANY folder as the writable data root.
+        // The picked tree URI resolves to a /storage path; with All-Files
+        // Access the write-probe passes and finishSystemDirStep persists it.
+        val systemFolderLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenDocumentTree()
+        ) { treeUri: Uri? ->
+            if (treeUri == null) return@rememberLauncherForActivityResult
+            val posix = Main.resolveTreeUriToPosix(treeUri.toString())
+            if (posix == null || !Main.validateSystemDirWritable(posix)) {
+                systemDirError.value = if (!allFilesAccessGranted())
+                    "Couldn't write to that folder. Grant All-Files Access, then pick it again."
+                else
+                    "That folder can't be used for writable emulator data. Try another."
+                return@rememberLauncherForActivityResult
+            }
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            } catch (_: SecurityException) { /* already persisted */ }
+            systemDirUri.value = treeUri
+            systemDirDisplay.value = treeUri.lastPathSegment?.substringAfterLast(':')?.ifBlank { null }
+                ?: "Custom folder"
+            systemDirUseDefault.value = false
+            systemDirError.value = null
+            refreshAllowNext()
+        }
+
+        // Tracks All-Files Access so the chooser's button label flips to
+        // "Custom Folder…" the moment the user returns from granting it.
+        // StartActivityForResult fires its callback on return regardless of
+        // result code, so we just re-read the permission state then.
+        val allFilesGranted = remember { mutableStateOf(allFilesAccessGranted()) }
+        val allFilesSettingsLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) {
+            allFilesGranted.value = allFilesAccessGranted()
+        }
+        fun launchAllFilesAccess() {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+            try {
+                allFilesSettingsLauncher.launch(
+                    Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + context.packageName)))
+            } catch (_: Exception) {
+                // Some OEMs don't honor the per-app action; fall back to the global list.
+                try {
+                    allFilesSettingsLauncher.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                } catch (_: Exception) { /* nothing else to try */ }
+            }
+        }
+
+        // Internal (app-private) — the no-permission default. Shared by the
+        // dashboard's Internal button and the github storage chooser.
+        fun applyInternalSystem() {
+            systemDirUseDefault.value = true
+            systemDirUri.value = null
+            systemDirDisplay.value = null
+            systemDirError.value = null
+            Main.systemDir.value = null
+            Main.prefs.edit().remove("systemDir").apply()
+            refreshAllowNext()
+        }
+
+        // SD Card — the SD's app-specific dir (raw-writable, no permission).
+        // Falls fully back to Internal with a visible reason when no card is
+        // present. Shared by the dashboard SD pick and the github chooser.
+        fun applySdCardSystem() {
+            val sd = Main.sdCardDataDir(context)
+            if (sd == null) {
+                systemDirError.value = "No SD card detected — staying on Internal storage."
+                systemDirUseDefault.value = true
+                systemDirUri.value = null
+                systemDirDisplay.value = null
+                Main.systemDir.value = null
+                Main.prefs.edit().remove("systemDir").apply()
+            } else {
+                Main.systemDir.value = sd
+                Main.prefs.edit().putString("systemDir", sd).apply()
+                systemDirUseDefault.value = false
+                systemDirDisplay.value = "SD Card"
+                systemDirError.value = null
+            }
+            refreshAllowNext()
         }
 
         fun openBiosFlow() {
@@ -669,9 +821,56 @@ object SetupImpl {
                 refreshAllowNext()
                 return
             }
+            // Re-entry (settings cog) where the data root actually CHANGED:
+            // native pinned EmuFolders::DataRoot once at startup and can't
+            // hot-swap it, so the new location won't take effect until a cold
+            // start. Confirm + restart instead of silently leaving data behind.
+            // (First run has no prior init root → currentInitDataRoot() is null
+            // and setupComplete is false, so it completes normally.)
+            if (Main.setupComplete.value &&
+                Main.currentInitDataRoot() != null &&
+                Main.assetCopyRoot(context) != Main.currentInitDataRoot()
+            ) {
+                storageRestartPending.value = true
+                return
+            }
+            // First run only: offer the optional Recommended Settings step before
+            // finishing. It's an overlay with its own Skip / Finish, so it can NEVER
+            // block first-run. Re-entry (Settings cog) finishes straight away as before.
+            if (!Main.setupComplete.value) {
+                loadRecommendedFromGlobal()
+                showRecommended.value = true
+                return
+            }
             Main.finishSetup()
             allowPrev.value = false
             allowNext.value = false
+        }
+
+        fun finishRecommendedAndComplete(apply: Boolean) {
+            if (apply) {
+                finishRendererStep() // persist the OpenGL/Vulkan + driver pick
+                finishRecommendedStep()
+            }
+            showRecommended.value = false
+            allowPrev.value = false
+            allowNext.value = false
+            // First-run with a NON-internal data root (SD card / custom folder): bind it
+            // via a COLD RESTART rather than the in-process init. native initialize() pins
+            // EmuFolders::DataRoot once per process; pinning an SD/custom root in-process on
+            // a fresh setup leaves games unable to boot — they bounce straight back to the
+            // library. (Switching the root LATER already worked precisely because that path
+            // cold-restarts; this mirrors it for first run.) Internal (systemDir == null)
+            // binds fine in-process and needs no restart. Commit synchronously first because
+            // restartApp's Runtime.exit() skips pending async SharedPreferences applies — and
+            // ConfigStore shares Main.prefs, so this one commit also flushes the chosen root,
+            // BIOS path, and any Recommended-Settings picks.
+            if (Main.systemDir.value != null) {
+                Main.prefs.edit().putBoolean("setupComplete", true).commit()
+                Main.restartApp(context)
+                return
+            }
+            Main.finishSetup()
         }
 
         Box(
@@ -693,7 +892,12 @@ object SetupImpl {
                     )
                 }
                 else -> {
-                    if (showBiosChooser.value) {
+                    if (showRecommended.value) {
+                        SetupRecommendedOverlay(
+                            onSkip = { finishRecommendedAndComplete(apply = false) },
+                            onFinish = { finishRecommendedAndComplete(apply = true) },
+                        )
+                    } else if (showBiosChooser.value) {
                         BiosChooserOverlay(
                             onBack = {
                                 showBiosChooser.value = false
@@ -712,14 +916,18 @@ object SetupImpl {
                                 allowPrev.value = false
                                 allowNext.value = true
                             },
-                            onUseDefaultSystem = {
-                                systemDirUseDefault.value = true
-                                systemDirUri.value = null
-                                systemDirDisplay.value = null
-                                systemDirError.value = null
-                                refreshAllowNext()
+                            onUseDefaultSystem = { applyInternalSystem() },
+                            onPickSystem = {
+                                // play build: SD Card directly — arbitrary folders need
+                                // all-files access, which the Play build avoids for policy
+                                // compliance. github build: open the chooser so the user
+                                // can pick Internal, SD, or ANY folder (All-Files Access).
+                                if (BuildConfig.STORAGE_ALL_FILES) {
+                                    showStorageChooser.value = true
+                                } else {
+                                    applySdCardSystem()
+                                }
                             },
-                            onPickSystem = { systemLauncher.launch(null) },
                             onPickBiosFolder = { openBiosFlow() },
                             onPickRoms = { romsLauncher.launch(null) },
                             onRemoveRoms = {
@@ -730,6 +938,153 @@ object SetupImpl {
                         )
                     }
                 }
+            }
+            if (storageRestartPending.value) {
+                StorageRestartOverlay(
+                    onRestart = {
+                        Main.finishSetup()
+                        Main.restartApp(context)
+                    },
+                    onCancel = { storageRestartPending.value = false },
+                )
+            }
+            if (showStorageChooser.value) {
+                StorageChooserOverlay(
+                    granted = allFilesGranted.value,
+                    onInternal = { applyInternalSystem(); showStorageChooser.value = false },
+                    onSdCard = { applySdCardSystem(); showStorageChooser.value = false },
+                    onCustomFolder = {
+                        // Need All-Files Access first; granting it refreshes
+                        // allFilesGranted (launcher callback) so the button flips to
+                        // "Custom Folder…" and a second tap opens the picker.
+                        if (allFilesGranted.value) {
+                            showStorageChooser.value = false
+                            systemFolderLauncher.launch(null)
+                        } else {
+                            launchAllFilesAccess()
+                        }
+                    },
+                    onDismiss = { showStorageChooser.value = false },
+                )
+            }
+        }
+    }
+
+    @Composable
+    private fun StorageRestartOverlay(onRestart: () -> Unit, onCancel: () -> Unit) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.78f))
+                // Absorb taps so the setup behind the modal can't be touched.
+                .clickable(onClick = {}),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth(0.82f)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color(0xFF0C1418))
+                    .border(1.dp, Color(0xFF38D5CB).copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    "Restart required",
+                    color = Color(0xFF7CF6EF),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Black,
+                )
+                Text(
+                    "Moving app data to a new location takes effect after a restart. " +
+                        "ARMSX2 will close and reopen now.",
+                    color = Color.White.copy(alpha = 0.82f),
+                    fontSize = 13.sp,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    SetupMiniButton(
+                        text = "Cancel",
+                        modifier = Modifier.weight(1f).height(40.dp),
+                        onClick = onCancel,
+                    )
+                    SetupMiniButton(
+                        text = "Restart now",
+                        modifier = Modifier.weight(1f).height(40.dp),
+                        onClick = onRestart,
+                    )
+                }
+            }
+        }
+    }
+
+    /** github (all-files) storage picker. Internal / SD / any folder. The
+     *  Custom Folder button first ensures All-Files Access (its label flips to
+     *  "Grant All-Files Access…" until granted), then opens the folder picker.
+     *  Never shown on the play build. */
+    @Composable
+    private fun StorageChooserOverlay(
+        granted: Boolean,
+        onInternal: () -> Unit,
+        onSdCard: () -> Unit,
+        onCustomFolder: () -> Unit,
+        onDismiss: () -> Unit,
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.78f))
+                // Absorb taps on the scrim so the setup behind can't be touched.
+                .clickable(onClick = {}),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth(0.82f)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color(0xFF0C1418))
+                    .border(1.dp, Color(0xFF38D5CB).copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    "App data location",
+                    color = Color(0xFF7CF6EF),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Black,
+                )
+                Text(
+                    "Internal lives in app-private storage (wiped on uninstall). SD Card creates " +
+                        "an app-prefixed folder on your card, meant for Google Play users. Custom " +
+                        "Folder uses All-Files Access to keep your data in a real folder you choose, " +
+                        "so it survives uninstalls.",
+                    color = Color.White.copy(alpha = 0.82f),
+                    fontSize = 12.sp,
+                )
+                SetupMiniButton(
+                    text = "Internal (app-private)",
+                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                    onClick = onInternal,
+                )
+                SetupMiniButton(
+                    text = "SD Card",
+                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                    onClick = onSdCard,
+                )
+                SetupMiniButton(
+                    text = if (granted) "Custom Folder…" else "Grant All-Files Access…",
+                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                    onClick = onCustomFolder,
+                )
+                SetupMiniButton(
+                    text = "Cancel",
+                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                    onClick = onDismiss,
+                )
             }
         }
     }
@@ -945,16 +1300,21 @@ object SetupImpl {
                     item {
                         SetupStepCard(
                             step = "1.",
-                            title = "Select App Folder",
-                            description = "Pick a folder for memory cards, save states, and configs. You can also use the app-private default.",
+                            title = "App Data Folder",
+                            description = if (BuildConfig.STORAGE_ALL_FILES)
+                                "Where memory cards, save states, and configs are stored. Choose Internal, an SD card, or a custom folder. (Game ROMs are added separately.)"
+                            else
+                                "Where memory cards, save states, and configs are stored. Internal uses your main device storage; SD Card uses a memory card if one is present. (Game ROMs are added separately.)",
                             ready = appFolderReady(),
                             status = appFolderStatus(),
                             visual = SetupVisual.Folder,
-                            onClick = onPickSystem,
-                            primaryLabel = "Select Folder",
+                            // github build: one button opens the Internal/SD/Custom chooser.
+                            // play build: SD Card / Internal as before.
+                            onClick = if (BuildConfig.STORAGE_ALL_FILES) onPickSystem else onUseDefaultSystem,
+                            primaryLabel = if (BuildConfig.STORAGE_ALL_FILES) "Choose Data Location" else "SD Card",
                             onPrimary = onPickSystem,
-                            secondaryLabel = "Use Default",
-                            onSecondary = onUseDefaultSystem,
+                            secondaryLabel = if (BuildConfig.STORAGE_ALL_FILES) null else "Internal",
+                            onSecondary = if (BuildConfig.STORAGE_ALL_FILES) null else onUseDefaultSystem,
                         )
                     }
                     item {
@@ -1047,7 +1407,10 @@ object SetupImpl {
                 SetupTapZone(
                     modifier = Modifier
                         .offset(x = maxWidth * 0.06f, y = maxHeight * 0.07f)
-                        .size(width = maxWidth * 0.88f, height = maxHeight * 0.20f),
+                        // Height trimmed (0.20→0.17) so this SD-Card hit area no
+                        // longer overlaps the "Internal" pill below (at y 0.252+),
+                        // which otherwise stole taps near the boundary.
+                        .size(width = maxWidth * 0.88f, height = maxHeight * 0.17f),
                     onClick = onPickSystem,
                 )
                 SetupTapZone(
@@ -1071,12 +1434,26 @@ object SetupImpl {
                         .size(width = maxWidth * 0.50f, height = maxHeight * 0.032f),
                 )
                 SetupMiniButton(
-                    text = "Default",
+                    // github: one chooser entry point; play: the Internal shortcut.
+                    text = if (BuildConfig.STORAGE_ALL_FILES) "Choose" else "Internal",
                     modifier = Modifier
                         .offset(x = maxWidth * 0.68f, y = maxHeight * 0.252f)
                         .size(width = maxWidth * 0.20f, height = maxHeight * 0.038f),
-                    onClick = onUseDefaultSystem,
+                    onClick = if (BuildConfig.STORAGE_ALL_FILES) onPickSystem else onUseDefaultSystem,
                 )
+                // App-data error (e.g. "No SD card detected") — rendered HERE so a
+                // failed SD-Card tap is visible. Previously systemDirError only
+                // showed on SetupSystemDirContent, which this dashboard never opens,
+                // so picking SD on a device with no card appeared to do nothing.
+                systemDirError.value?.let { err ->
+                    SetupStatusChip(
+                        text = err,
+                        ready = false,
+                        modifier = Modifier
+                            .offset(x = maxWidth * 0.11f, y = maxHeight * 0.295f)
+                            .size(width = maxWidth * 0.82f, height = maxHeight * 0.04f),
+                    )
+                }
                 SetupStatusChip(
                     text = biosStatus(),
                     ready = biosReady(),
@@ -1448,7 +1825,7 @@ object SetupImpl {
 
     private fun appFolderStatus(): String {
         if (systemDirUseDefault.value || (Main.systemDir.value == null && Main.setupComplete.value)) {
-            return "Default app-private folder"
+            return "Internal storage (main device)"
         }
         return systemDirDisplay.value
             ?: Main.systemDir.value?.let { runCatching { Uri.parse(it).lastPathSegment }.getOrNull() ?: it }
@@ -1546,6 +1923,92 @@ object SetupImpl {
             if (selectedRenderer.value == "vulkan") {
                 Spacer(Modifier.height(20.dp))
                 GpuDriverSection()
+            }
+        }
+    }
+
+    /** Optional first-run "Recommended Settings" page (PCSX2-wizard style). Shown as
+     *  an overlay AFTER the core setup completes, so it can't block first-run; every
+     *  choice has a sensible default and the whole step is skippable. */
+    @Composable
+    private fun SetupRecommendedOverlay(onSkip: () -> Unit, onFinish: () -> Unit) {
+        // The GPU driver browser takes over the whole page when open (same as the
+        // renderer page does), so a custom Vulkan driver can be installed here.
+        if (showDriverBrowser.value) {
+            DriverBrowserSheet()
+            return
+        }
+        val blue = Color(0xFF1E6FE0)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 8.dp),
+        ) {
+            Text("Recommended Settings", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(
+                "Optional — set these now or change them anytime in Settings.",
+                color = Color(0xFFAAAAAA),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 2.dp, bottom = 14.dp),
+            )
+            RecChoiceRow("Renderer", listOf("OpenGL", "Vulkan"), if (selectedRenderer.value == "vulkan") 1 else 0, blue) {
+                selectedRenderer.value = if (it == 1) "vulkan" else "opengl"
+            }
+            if (selectedRenderer.value == "vulkan") {
+                Spacer(Modifier.height(2.dp))
+                GpuDriverSection()
+                Spacer(Modifier.height(12.dp))
+            }
+            RecChoiceRow("Aspect Ratio", listOf("Stretch", "Auto", "4:3", "16:9", "10:7"), recAspect.value, blue) { recAspect.value = it }
+            RecChoiceRow("Internal Resolution", listOf("1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x"), recUpscale.value - 1, blue) { recUpscale.value = it + 1 }
+            RecChoiceRow("Anti-Blur", listOf("Off", "On"), if (recAntiBlur.value) 1 else 0, blue) { recAntiBlur.value = it == 1 }
+            RecChoiceRow("Widescreen Patches", listOf("Off", "On"), if (recWidescreen.value) 1 else 0, blue) { recWidescreen.value = it == 1 }
+            RecChoiceRow("Deinterlacing", listOf("Auto", "Off"), if (recDeinterlaceOff.value) 1 else 0, blue) { recDeinterlaceOff.value = it == 1 }
+            RecChoiceRow("Performance", listOf("Optimal", "Fast"), if (recPerfFast.value) 1 else 0, blue) { recPerfFast.value = it == 1 }
+            Spacer(Modifier.height(20.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(
+                    onClick = onSkip,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2A2A2A), contentColor = Color.White),
+                    shape = RoundedCornerShape(8.dp),
+                ) { Text("Skip") }
+                Button(
+                    onClick = onFinish,
+                    colors = ButtonDefaults.buttonColors(containerColor = blue, contentColor = Color.White),
+                    shape = RoundedCornerShape(8.dp),
+                ) { Text("Apply & Finish") }
+            }
+            Spacer(Modifier.height(14.dp))
+        }
+    }
+
+    @Composable
+    private fun RecChoiceRow(
+        label: String,
+        options: List<String>,
+        selected: Int,
+        accent: Color,
+        onSelect: (Int) -> Unit,
+    ) {
+        Column(Modifier.padding(bottom = 12.dp)) {
+            Text(label, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Row(
+                modifier = Modifier.padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                options.forEachIndexed { i, opt ->
+                    val sel = i == selected
+                    Button(
+                        onClick = { onSelect(i) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (sel) accent else Color(0xFF24262B),
+                            contentColor = Color.White,
+                        ),
+                        shape = RoundedCornerShape(6.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    ) { Text(opt, fontSize = 12.sp) }
+                }
             }
         }
     }
@@ -1944,7 +2407,10 @@ object SetupImpl {
                 .padding(12.dp),
         ) {
             Text(
-                remote.releaseName.ifBlank { remote.assetName },
+                run {
+                    val base = remote.releaseName.ifBlank { remote.assetName }
+                    if (remote.source.isNotEmpty()) "${remote.source} · $base" else base
+                },
                 color = Color.White,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,
@@ -2211,17 +2677,15 @@ object SetupImpl {
     private fun SetupSystemDirContent() {
         Column(Modifier.fillMaxSize()) {
             Text(
-                "Pick the folder ARMSX2 should use for system files (memory cards, save states, configs). " +
-                "Defaults to Android/data/com.armsx2/files when unset.",
+                "ARMSX2 stores memory cards, save states, configs, and shader data in app-private storage by default. " +
+                "Use a custom folder only if Android exposes it as a native-writable path. " +
+                "Game folders can still be added from SD card on the ROM folder step.",
                 fontSize = 14.sp, color = Color.LightGray,
                 modifier = Modifier.padding(bottom = 12.dp),
             )
 
             // Validation error banner — surfaces the scoped-storage write
-            // rejection so the user knows why Next refused. The grant
-            // intent has already been launched at this point on
-            // Android 11+; the user just needs to flip the toggle and
-            // re-tap Next.
+            // rejection so the user knows why Next refused the custom folder.
             val err = systemDirError.value
             if (err != null) {
                 Row(
@@ -2269,12 +2733,12 @@ object SetupImpl {
                     Column(Modifier.weight(1f)) {
                         Text("Using App-Private Folder", color = Color.White, fontSize = 13.sp,
                             fontWeight = FontWeight.Bold)
-                        Text("Android/data/com.armsx2/files",
+                        Text("App-private Android/data folder",
                             color = Color.LightGray, fontSize = 11.sp)
                     }
                 }
             } else {
-                Text("No system folder selected yet — use the Pick System Folder button below.",
+                Text("No system data folder selected yet. Use the app-private default or pick a custom folder.",
                     color = Color.LightGray)
             }
 

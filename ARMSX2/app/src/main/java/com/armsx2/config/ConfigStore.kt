@@ -37,28 +37,61 @@ enum class SettingsScope { Global, Game }
 object ConfigStore {
     private const val KEY_GLOBAL = "config.global"
     private const val KEY_BLEND_BASIC_MIGRATED = "config.migrated.blendBasic"
+    // One-time seed of the (now per-game) renderer/upscale fields from the legacy
+    // global prefs, so updating doesn't reset everyone's backend/resolution.
+    private const val KEY_RENDERER_MIGRATED = "config.migrated.rendererUpscale"
     private fun keyForGame(serial: String) = "config.game.$serial"
 
     fun loadGlobal(): Settings {
-        val raw = Main.prefs.getString(KEY_GLOBAL, null) ?: return Settings()
-        val parsed = try {
-            Settings.fromJson(JSONObject(raw))
-        } catch (_: Exception) {
+        val raw = Main.prefs.getString(KEY_GLOBAL, null)
+        var parsed = if (raw != null) {
+            try { Settings.fromJson(JSONObject(raw)) } catch (_: Exception) { Settings() }
+        } else {
             Settings()
         }
-        val migrated = Main.prefs.getBoolean(KEY_BLEND_BASIC_MIGRATED, false)
-        if (!migrated && parsed.accurateBlendingUnit == 4) {
-            val updated = parsed.copy(accurateBlendingUnit = 1)
-            Main.prefs.edit()
-                .putBoolean(KEY_BLEND_BASIC_MIGRATED, true)
-                .putString(KEY_GLOBAL, updated.toJson().toString())
-                .commit()
-            return updated
+        var dirty = false
+
+        // Legacy: "Basic" blending migration.
+        if (raw != null && !Main.prefs.getBoolean(KEY_BLEND_BASIC_MIGRATED, false) &&
+            parsed.accurateBlendingUnit == 4) {
+            parsed = parsed.copy(accurateBlendingUnit = 1)
+            dirty = true
         }
-        if (!migrated) {
+        if (!Main.prefs.getBoolean(KEY_BLEND_BASIC_MIGRATED, false)) {
             Main.prefs.edit().putBoolean(KEY_BLEND_BASIC_MIGRATED, true).apply()
         }
+
+        // Seed renderer/upscale from the legacy global prefs (where they used to
+        // live) into the Settings tier, once. After this they're scope-aware like
+        // every other setting; the old prefs become vestigial.
+        if (!Main.prefs.getBoolean(KEY_RENDERER_MIGRATED, false)) {
+            Main.prefs.getString("renderer", null)?.takeIf { it.isNotBlank() }?.let {
+                parsed = parsed.copy(renderer = it)
+                dirty = true
+            }
+            legacyUpscalePref()?.let {
+                parsed = parsed.copy(upscaleFloat = it)
+                dirty = true
+            }
+            Main.prefs.edit().putBoolean(KEY_RENDERER_MIGRATED, true).apply()
+        }
+
+        if (dirty) saveGlobal(parsed)
         return parsed
+    }
+
+    /** Read the legacy global upscale pref (float, or older int/string), or null. */
+    private fun legacyUpscalePref(): Float? {
+        val all = Main.prefs.all
+        fun coerce(raw: Any?): Float? = when (raw) {
+            is Float -> raw
+            is Double -> raw.toFloat()
+            is Int -> raw.toFloat()
+            is Long -> raw.toFloat()
+            is String -> raw.toFloatOrNull()
+            else -> null
+        }?.coerceIn(0.25f, 8.0f)
+        return coerce(all["upscaleFloat"]) ?: coerce(all["upscale"])
     }
 
     fun saveGlobal(s: Settings) {

@@ -1908,6 +1908,7 @@ SCAJ-20104:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 3 # Fixes ghosting in foggy maps.
     roundSprite: 1 # Fixes font and HUD artifacts.
@@ -2443,6 +2444,7 @@ SCAJ-20173:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 3 # Fixes ghosting in foggy maps.
     roundSprite: 1 # Fixes HUD artifacts.
@@ -4926,6 +4928,7 @@ SCES-50410:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 5 # Fixes bloom misalignment.
     roundSprite: 1 # Fixes font and HUD artifacts.
@@ -6403,6 +6406,7 @@ SCES-54041:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 3 # Fixes ghosting in foggy maps.
     roundSprite: 1 # Fixes HUD artifacts.
@@ -7539,6 +7543,7 @@ SCKA-20042:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 3 # Fixes ghosting in foggy maps.
     roundSprite: 1 # Fixes font and HUD artifacts.
@@ -7820,6 +7825,7 @@ SCKA-20070:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 3 # Fixes ghosting in foggy maps.
     roundSprite: 1 # Fixes HUD artifacts.
@@ -68632,6 +68638,7 @@ SLUS-20851:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 3 # Fixes ghosting in foggy maps.
     roundSprite: 1 # Fixes font and HUD artifacts.
@@ -71848,6 +71855,7 @@ SLUS-21346:
   gameFixes:
     - SoftwareRendererFMVHack # Fixes FMVs disabling hash cache.
   gsHWFixes:
+    texturePreloading: 1 # Partial preload: avoids FMV hash-cache stalls; mobile-friendly.
     recommendedBlendingLevel: 2 # Helps banding when dithering is enabled.
     halfPixelOffset: 3 # Fixes ghosting in foggy maps.
     roundSprite: 1 # Fixes HUD artifacts.

@@ -139,7 +139,11 @@ bool ImGuiManager::Initialize()
 	}
 	Console.WriteLn("@@ANDROID_GL_INIT@@ stage=imgui_fontdata_done");
 
-	s_global_scale = std::max(0.5f, g_gs_device->GetWindowScale() * (GSConfig.OsdScale / 100.0f));
+	// Cap the OSD/ImGui scale at 2x. GetWindowScale() is resolution-proportional
+	// (max(w,h)/800), so high-res phones produced a 3-4x overlay that ballooned
+	// across the screen. Clamping the FINAL scale also tames an over-large
+	// OsdScale setting. Floor stays 0.5 for low-DPI handhelds.
+	s_global_scale = std::min(2.0f, std::max(0.5f, g_gs_device->GetWindowScale() * (GSConfig.OsdScale / 100.0f)));
 	s_scale_changed = false;
 
 	ImGuiContext& g = *ImGui::CreateContext();
@@ -289,7 +293,8 @@ void ImGuiManager::ReloadFonts()
 void ImGuiManager::UpdateScale()
 {
 	const float window_scale = g_gs_device ? g_gs_device->GetWindowScale() : 1.0f;
-	const float scale = std::max(window_scale * (EmuConfig.GS.OsdScale / 100.0f), 0.5f);
+	// Cap at 2x — see note in the init path; keeps the OSD compact on high-res screens.
+	const float scale = std::min(2.0f, std::max(window_scale * (EmuConfig.GS.OsdScale / 100.0f), 0.5f));
 
 	if ((!ImGuiFullscreen::UpdateLayoutScale()) && scale == s_global_scale)
 		return;

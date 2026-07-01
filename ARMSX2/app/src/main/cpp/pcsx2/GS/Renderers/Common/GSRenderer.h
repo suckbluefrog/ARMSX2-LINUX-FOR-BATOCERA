@@ -20,6 +20,9 @@ private:
 	u32 m_dump_frames = 0;
 	u32 m_skipped_duplicate_frames = 0;
 	u32 m_manual_frameskip_counter = 0;
+	// Scheduled CPU-tick time of the next allowed present for the display FPS cap
+	// (accumulator pacer — see GSRenderer::VSync). 0 = not primed yet.
+	u64 m_fps_cap_next_present = 0;
 
 private:
 	// Tracking draw counters for idle frame detection.

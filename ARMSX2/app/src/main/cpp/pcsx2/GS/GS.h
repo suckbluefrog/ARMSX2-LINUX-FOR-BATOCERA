@@ -75,6 +75,16 @@ void GSvsync(u32 field, bool registers_written);
 // VSyncs, skipping presentation of the rest. 0 disables. See GSRenderer::VSync.
 void GSSetManualFrameSkip(u32 frames);
 u32 GSGetManualFrameSkip();
+// Max presented-FPS cap (Android). Caps the DISPLAY frame rate without touching
+// emulation speed — dropped on the GS thread in GSRenderer::VSync. 0 disables.
+void GSSetMaxPresentFps(u32 fps, u64 present_interval);
+u32 GSGetMaxPresentFps();
+u64 GSGetMaxPresentInterval();
+// While true (set when the limiter enters Turbo / fast-forward), the present cap
+// above is bypassed so the speed-up is actually visible. The cap resumes — with
+// a clean re-prime, no catch-up burst — as soon as fast-forward ends.
+void GSSetPresentCapSuspended(bool suspended);
+bool GSGetPresentCapSuspended();
 int GSfreeze(FreezeAction mode, freezeData* data);
 std::string GSGetBaseSnapshotFilename();
 std::string GSGetBaseVideoFilename();

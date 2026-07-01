@@ -14,6 +14,8 @@ object LiveGsApplyQueue {
     private val settingsRunning = AtomicBoolean(false)
     private val latestUpscale = AtomicReference<Float?>(null)
     private val upscaleRunning = AtomicBoolean(false)
+    private val latestFramerate = AtomicReference<Pair<Float, Float>?>(null)
+    private val framerateRunning = AtomicBoolean(false)
 
     fun applySettings(settings: Settings) {
         latestSettings.set(settings)
@@ -25,6 +27,16 @@ object LiveGsApplyQueue {
         latestUpscale.set(multiplier)
         if (upscaleRunning.compareAndSet(false, true))
             executor.execute(::drainUpscale)
+    }
+
+    /** Live per-region framerate (NTSC, PAL). Coalesced + run off the UI thread
+     *  because applyFramerateLive parks the VM (UpdateVSyncRate touches EE-thread
+     *  counters). Persists to the native base layer first so a later full
+     *  ApplySettings reload can't revert it. */
+    fun applyFramerate(ntsc: Float, pal: Float) {
+        latestFramerate.set(ntsc to pal)
+        if (framerateRunning.compareAndSet(false, true))
+            executor.execute(::drainFramerate)
     }
 
     private fun drainSettings() {
@@ -55,6 +67,26 @@ object LiveGsApplyQueue {
             upscaleRunning.set(false)
             if (latestUpscale.get() != null && upscaleRunning.compareAndSet(false, true))
                 executor.execute(::drainUpscale)
+        }
+    }
+
+    private fun drainFramerate() {
+        try {
+            while (true) {
+                val (ntsc, pal) = latestFramerate.getAndSet(null) ?: break
+                runCatching {
+                    // Persist to the native base layer so a subsequent full
+                    // ApplySettings (e.g. EE-cycle commit) keeps the new rate.
+                    NativeApp.setSetting("EmuCore/GS", "FramerateNTSC", "float", ntsc.toString())
+                    NativeApp.setSetting("EmuCore/GS", "FrameratePAL", "float", pal.toString())
+                    NativeApp.applyFramerateLive(ntsc, pal)
+                }.onFailure { println("@@ANDROID_GS_LIVE_QUEUE@@ framerate_error=${it.javaClass.simpleName}") }
+                println("@@ANDROID_GS_LIVE_QUEUE@@ framerate ntsc=$ntsc pal=$pal")
+            }
+        } finally {
+            framerateRunning.set(false)
+            if (latestFramerate.get() != null && framerateRunning.compareAndSet(false, true))
+                executor.execute(::drainFramerate)
         }
     }
 }

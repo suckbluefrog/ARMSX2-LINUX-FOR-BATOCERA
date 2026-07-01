@@ -12,7 +12,12 @@
 #include "R3000A.h"
 #include "VMManager.h"
 
+#include "common/Console.h"
 #include "common/Error.h"
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include "SPU2/spu2_neon.h"
+#endif
 
 const StereoOut32 StereoOut32::Empty(0, 0);
 
@@ -113,6 +118,17 @@ void SPU2::CreateOutputStream()
 	else if (!s_output_muted)
 		SPU2::SaveOutputVolume();
 
+	// Carry the OLD stream's actual paused state across the recreate instead of
+	// reading the live VMManager state. Audio was muting after using the in-game
+	// menu (save-state load / applying fixes): those run inside a transient
+	// ScopedVMPause, so VMManager::GetState() reads Paused and the freshly built
+	// stream was created paused BEFORE it ever started — and a never-started stream
+	// paused immediately doesn't reliably resume, so sound stayed muted once the
+	// menu closed. Preserving the prior stream's paused flag keeps an audibly-
+	// running game running through the recreate. (No prior stream → fall back to VM
+	// state, the original first-boot behaviour.)
+	const bool was_paused = s_output_stream ? s_output_stream->IsPaused()
+	                                        : (VMManager::GetState() == VMState::Paused);
 	const u32 sample_rate = GetConsoleSampleRate();
 	s_output_stream.reset();
 
@@ -130,7 +146,7 @@ void SPU2::CreateOutputStream()
 
 	SPU2::UpdateOutputVolume();
 	s_output_stream->SetNominalRate(GetNominalRate());
-	s_output_stream->SetPaused(VMManager::GetState() == VMState::Paused);
+	s_output_stream->SetPaused(was_paused);
 }
 
 void SPU2::UpdateSampleRate()
@@ -210,9 +226,24 @@ void SPU2::SaveOutputVolume()
 	}
 }
 
+// Settings-apply parks the VM (commitSettings / live GS) and the pause edge
+// would otherwise pause the output device. A heavy gamefix can park for
+// seconds; pausing a low-latency Android stream that long lets the OS reclaim
+// it, and the recovery raced the resume so audio stayed dead until a manual
+// menu resume. When this is set, the pause/resume edges are skipped and the
+// stream is left running (silence-on-underrun) for the duration of the park.
+static bool s_output_pause_suppressed = false;
+
 void SPU2::SetOutputPaused(bool paused)
 {
+	if (s_output_pause_suppressed)
+		return;
 	s_output_stream->SetPaused(paused);
+}
+
+void SPU2::SetOutputPauseSuppressed(bool suppressed)
+{
+	s_output_pause_suppressed = suppressed;
 }
 
 void SPU2::SetAudioCaptureActive(bool active)
@@ -230,6 +261,18 @@ void SPU2::InternalReset(bool psxmode)
 	spu2Mix = MULTI_ISA_SELECT(spu2Mix);
 	ReverbDownsample = MULTI_ISA_SELECT(ReverbDownsample);
 	ReverbUpsample = MULTI_ISA_SELECT(ReverbUpsample);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+	// Optional NEON reverb FIR (opt-in, default off). Overrides the Multi-ISA
+	// scalar reverb resamplers assigned just above. Read fresh on every reset so
+	// toggling the "SPU2 SIMD audio" setting + rebooting the game switches
+	// backends. When off, the scalar reference (current default) is used.
+	if (Host::GetBaseBoolSettingValue("SPU2", "NeonReverbSIMD", false))
+	{
+		SPU2::RegisterNEONBackend();
+		Console.WriteLn("SPU2: NEON reverb SIMD backend enabled");
+	}
+#endif
 
 	s_current_chunk_pos = 0;
 	s_psxmode = psxmode;

@@ -364,19 +364,15 @@ bool Patch::ContainsPatchName(const std::vector<PatchInfo>& patches, const std::
 template <typename F>
 void Patch::EnumeratePnachFiles(const std::string_view serial, u32 crc, bool cheats, bool for_ui, const F& f)
 {
-	// RetroAchievements hardcore: game patches — widescreen / user .pnach from
-	// the in-app patch manager, whether on disk OR in the bundled patches zip —
-	// confer an advantage and must not apply. Skip loading them entirely while
-	// hardcore is active. UI browsing (for_ui) stays allowed so the picker keeps
-	// working; cheats are gated separately via the emptied enabled-cheats list;
-	// GameDB compatibility patches use a different path and are unaffected.
-	if (!cheats && !for_ui && Achievements::IsHardcoreModeActive())
-		return;
+	// Non-cheat patches (widescreen / no-interlacing / user .pnach from the patch
+	// manager) DO load and apply in RetroAchievements hardcore, matching desktop
+	// PCSX2 — they're cosmetic and don't confer a gameplay advantage. Cheats stay
+	// disabled separately: EnforceAchievementsChallengeModeSettings forces
+	// EnableCheats=false and ReloadEnabledLists empties the enabled-cheats list
+	// while hardcore is active, so cheat pnachs never reach the active set.
 
 	// Prefer files on disk over the zip.
-	std::vector<std::string> disk_patch_files;
-	if (for_ui || !Achievements::IsHardcoreModeActive())
-		disk_patch_files = FindPatchFilesOnDisk(serial, crc, cheats, for_ui);
+	std::vector<std::string> disk_patch_files = FindPatchFilesOnDisk(serial, crc, cheats, for_ui);
 
 	bool unlabeled_patch_found = false;
 	if (!disk_patch_files.empty())
@@ -599,13 +595,11 @@ void Patch::ReloadEnabledLists()
 	else
 		s_enabled_cheats = {};
 
-	// Hardcore: clear the enabled-patches list too (mirrors the cheats handling
-	// above). Defensive — EnumeratePnachFiles already refuses to load patch
-	// content in hardcore, so there are no groups to match anyway.
-	std::vector<std::string> next_enabled_patches;
-	if (!Achievements::IsHardcoreModeActive())
-		next_enabled_patches = Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY);
-	const std::vector<std::string> prev_enabled_patches = std::exchange(s_enabled_patches, std::move(next_enabled_patches));
+	// Patches (widescreen / no-interlacing / compat) ARE enabled in hardcore, like
+	// desktop PCSX2 — they're cosmetic, not cheats. The enabled-cheats list above
+	// stays emptied in hardcore, so only patches (never cheats) become active.
+	const std::vector<std::string> prev_enabled_patches = std::exchange(s_enabled_patches,
+		Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY));
 	const std::vector<std::string> disabled_patches = Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_DISABLE_CONFIG_KEY);
 
 	// Name based matching for widescreen/NI settings.
@@ -802,7 +796,15 @@ void Patch::UpdateActivePatches(bool reload_enabled_list, bool verbose, bool ver
 			TRANSLATE_PLURAL_STR("Patch", "%n game patches are active.", "OSD Message", p_count));
 
 	u32 c_count = 0;
-	if (EmuConfig.EnableCheats)
+	// Cheats are forbidden in RetroAchievements hardcore mode. EnableCheats is
+	// normally masked off by EnforceAchievementsChallengeModeSettings, but the
+	// Android PNACH reload path (reloadPatches JNI -> VMManager::ReloadPatches)
+	// does NOT re-run that enforcement and can see a stale EnableCheats=true, and
+	// this Android block builds its enable list from s_cheat_patches directly
+	// (bypassing the s_enabled_cheats list that ReloadEnabledLists empties in
+	// hardcore). Gate explicitly here. Non-cheat patches (widescreen/no-interlace
+	// /GameDB) use s_enabled_patches above and intentionally stay active.
+	if (EmuConfig.EnableCheats && !Achievements::IsHardcoreModeActive())
 	{
 #if defined(__ANDROID__)
 		// Android's current PNACH UI imports/executes whole files, but does

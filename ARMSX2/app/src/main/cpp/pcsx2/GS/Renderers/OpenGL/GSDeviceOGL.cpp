@@ -214,10 +214,11 @@ std::vector<GSAdapterInfo> GSDeviceOGL::GetAdapterInfo()
 	return ret;
 }
 
-GSTexture* GSDeviceOGL::CreateSurface(GSTexture::Type type, int width, int height, int levels, GSTexture::Format format)
+GSTexture* GSDeviceOGL::CreateSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format)
 {
 	GL_PUSH("Create surface");
-	return new GSTextureOGL(type, width, height, levels, format);
+	pxAssert(GLAD_GL_ARB_shader_image_load_store || !GSTexture::IsShaderWrite(usage));
+	return new GSTextureOGL(usage, width, height, levels, format);
 }
 
 RenderAPI GSDeviceOGL::GetRenderAPI() const
@@ -661,6 +662,13 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	// Change depth convention
 	if (GLAD_GL_ARB_clip_control)
 		glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+	else if (m_is_gles && GLAD_GL_EXT_clip_control)
+		// GLES has no ARB_clip_control; GL_EXT_clip_control (advertised by Adreno, and
+		// some Mali) is the same API/enums. Without it, GLES uses the legacy z-remap that
+		// CLAMPS PS2 Z >= 2^24 to the far plane (tfx_vgs.glsl), collapsing far depth so
+		// large-Z world geometry z-fights/vanishes — e.g. God of War II's transparent
+		// walls. Pairs with HAS_CLIP_CONTROL below (same condition) so the shader matches.
+		glClipControlEXT(GL_LOWER_LEFT_EXT, GL_ZERO_TO_ONE_EXT);
 
 	Console.WriteLn("@@ANDROID_GL_INIT@@ stage=date_raster_done");
 	// ****************************************************************
@@ -856,7 +864,8 @@ bool GSDeviceOGL::CheckFeatures()
 				"GL_ARB_copy_image is not supported, copies will be slower.", Host::OSD_ERROR_DURATION);
 		}
 
-		if (!GLAD_GL_VERSION_4_5 && !GLAD_GL_ARB_clip_control)
+		if (!GLAD_GL_VERSION_4_5 && !GLAD_GL_ARB_clip_control &&
+			!(m_is_gles && GLAD_GL_EXT_clip_control))
 		{
 			Host::AddOSDMessage(
 				"GL_ARB_clip_control is not supported, depth will be less accurate.", Host::OSD_ERROR_DURATION);
@@ -1071,11 +1080,6 @@ bool GSDeviceOGL::CheckFeatures()
 	}
 	
 	m_features.aa1 = GSConfig.HWAA1 && m_features.vs_expand && m_features.feedback_loops();
-
-	if (GSConfig.HWROV)
-	{
-		Console.Warning("GL: ROV is not implemented for GL and will be disabled.");
-	}
 	
 	return true;
 }
@@ -1465,14 +1469,14 @@ void GSDeviceOGL::CommitClear(GSTexture* t, bool use_write_fbo)
 	{
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fbo_write);
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-			(t->GetType() == GSTexture::Type::RenderTarget) ? static_cast<GSTextureOGL*>(t)->GetID() : 0, 0);
+			t->IsRenderTarget() ? static_cast<GSTextureOGL*>(t)->GetID() : 0, 0);
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, m_features.framebuffer_fetch ? GL_DEPTH_ATTACHMENT : GL_DEPTH_STENCIL_ATTACHMENT,
-			GL_TEXTURE_2D, (t->GetType() == GSTexture::Type::DepthStencil) ? static_cast<GSTextureOGL*>(t)->GetID() : 0, 0);
+			GL_TEXTURE_2D, t->IsDepthStencil() ? static_cast<GSTextureOGL*>(t)->GetID() : 0, 0);
 	}
 	else
 	{
 		OMSetFBO(m_fbo);
-		if (T->GetType() == GSTexture::Type::DepthStencil)
+		if (T->IsDepthStencil())
 		{
 			if (GLState::rt && GLState::rt->GetSize() != T->GetSize())
 				OMAttachRt(nullptr);
@@ -1494,7 +1498,7 @@ void GSDeviceOGL::CommitClear(GSTexture* t, bool use_write_fbo)
 		// written back to system memory anyway. On TBDR that's pure waste.
 		if (GLAD_GL_VERSION_4_3 || m_is_gles)
 		{
-			if (T->GetType() == GSTexture::Type::DepthStencil)
+			if (T->IsDepthStencil())
 			{
 				const GLenum attachments[] = {GL_DEPTH_STENCIL_ATTACHMENT};
 				glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, std::size(attachments), attachments);
@@ -1554,7 +1558,7 @@ void GSDeviceOGL::CommitClear(GSTexture* t, bool use_write_fbo)
 	if (use_write_fbo)
 	{
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
-			(t->GetType() == GSTexture::Type::RenderTarget) ?
+			t->IsRenderTarget() ?
 				GL_COLOR_ATTACHMENT0 :
 				(m_features.framebuffer_fetch ? GL_DEPTH_ATTACHMENT : GL_DEPTH_STENCIL_ATTACHMENT),
 			GL_TEXTURE_2D, 0, 0);
@@ -1753,7 +1757,8 @@ std::string GSDeviceOGL::GenGlslHeader(const std::string_view entry, GLenum type
 		header += "#define DEPTH_FEEDBACK_SUPPORT 2\n"; // Depth as RT
 	}
 
-	if (!m_is_gles && GLAD_GL_ARB_clip_control)
+	// Must match the glClipControl(EXT) enable above: desktop ARB, or GLES with EXT.
+	if (GLAD_GL_ARB_clip_control || (m_is_gles && GLAD_GL_EXT_clip_control))
 		header += "#define HAS_CLIP_CONTROL 1\n";
 	else
 		header += "#define HAS_CLIP_CONTROL 0\n";
@@ -3057,7 +3062,7 @@ void GSDeviceOGL::RenderHW(GSHWDrawConfig& config)
 		{
 			config.colclip_update_area = config.drawarea;
 
-			colclip_rt = CreateRenderTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false);
+			colclip_rt = CreateFeedbackTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false);
 
 			if (!colclip_rt)
 			{

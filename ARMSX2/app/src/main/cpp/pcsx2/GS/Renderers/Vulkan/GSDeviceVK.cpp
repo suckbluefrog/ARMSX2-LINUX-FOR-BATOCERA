@@ -2201,7 +2201,7 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		return false;
 	}
 
-	if ((m_null_framebuffer = GSTextureVK::CreateNullFramebuffer()) == VK_NULL_HANDLE)
+	if ((m_null_framebuffer = GSTextureVK::CreateNullFramebuffer(m_max_framebuffer_width, m_max_framebuffer_height)) == VK_NULL_HANDLE)
 	{
 		Host::ReportErrorAsync("GS", "Failed to create dummy framebuffer");
 		return false;
@@ -2786,7 +2786,44 @@ bool GSDeviceVK::CheckFeatures()
 	// Basic. The pre-sync code drove the same extension differently and was
 	// fine; until that interplay is root-caused, take the barrier path, which
 	// renders correctly. (A/B-verified 2026-06-10 on Adreno 840.)
-	m_features.framebuffer_fetch = false &&
+	// Mali (ARM, vendorID 0x13B5): the hardware dual-source blend unit (INV_SRC1_COLOR,
+	// used for the blend-mix destination blends PCSX2 emits below Maximum accuracy)
+	// mis-renders on these drivers → white-band / blowout corruption on translucency and
+	// bloom unless the user forces Maximum blending. These GPUs also expose none of the
+	// coherent in-shader RT-read extensions (rasterization_order / feedback_loop_layout /
+	// fragment_shader_interlock), so framebuffer fetch is no help either — an earlier
+	// attempt to enable it only dropped the per-draw barriers and still corrupted (the
+	// HW dual-source path was still taken). Fix: select the Mali runtime GPU profile so
+	// the shared blend path's alpha_mali_custom_set (GSRendererHW.cpp) forces these alpha
+	// blends through the in-shader SW-blend path — reading Cd via the texture-barrier full
+	// barriers and never touching the broken HW unit. This is the exact workaround the
+	// OpenGL renderer already uses for Mali; on Vulkan we reach Cd via barriers instead of
+	// GL_ARM_shader_framebuffer_fetch. Its only cross-platform effect is enabling that one
+	// blend workaround (the GL-shader GPU_PROFILE_MALI defines are not used by the VK path).
+	if (m_device_properties.vendorID == 0x13B5u)
+		SetRuntimeGPUProfile(RuntimeGpuProfile::Mali);
+
+	// framebuffer_fetch: the tiler-native ordered Cd read (ROAA / subpassLoad in tile
+	// memory). It lets DetermineBarriers() (GSRendererHW.cpp) drop every per-primitive
+	// barrier and makes ROV (m_features.rov below) auto-disable — the fast, correct path
+	// for blend-heavy games on a TBDR.
+	//
+	// MALI (0x13B5): ENABLED by default when ROAA is present. The Mali profile forces SW
+	// blend, so fbfetch reads Cd in-shader and never touches Mali's broken HW dual-source
+	// unit; without fbfetch the per-PRIMITIVE texture-barrier path tanks blend-heavy games
+	// (GT4 = 10-20fps slideshow). No-op on any Mali lacking the extension.
+	//
+	// ADRENO / other non-Mali: OPT-IN only (EnableAdrenoFramebufferFetch, default off).
+	// ROV is the wrong primitive on a tiler (fragment_shader_interlock serializes same-pixel
+	// fragments + bypasses tile memory), so on Adreno fbfetch is the way to make accurate
+	// blending fast. Historically kept off because the Adreno-840 PROPRIETARY driver returned
+	// STALE ROAA reads above Basic blending (alpha cutouts / invisible floors, A/B 2026-06-10);
+	// that was never confirmed on other Adreno gens or on Turnip/Mesa, so this is gated behind
+	// a toggle to ship dark and be A/B-verified per device+driver. Gated on ROAA presence, so
+	// it is a no-op on any device that does not expose the extension.
+	const bool is_mali_vk = (m_device_properties.vendorID == 0x13B5u);
+	const bool vendor_allows_fbfetch = is_mali_vk || GSConfig.EnableAdrenoFramebufferFetch;
+	m_features.framebuffer_fetch = vendor_allows_fbfetch &&
 		m_optional_extensions.vk_ext_rasterization_order_attachment_access && !GSConfig.DisableFramebufferFetch;
 	m_features.texture_barrier = GSConfig.OverrideTextureBarriers != 0;
 	m_features.multidraw_fb_copy = false;
@@ -2841,14 +2878,18 @@ bool GSDeviceVK::CheckFeatures()
 		m_features.point_expand ? "hardware" : "vertex expanding",
 		m_features.line_expand ? "hardware" : "vertex expanding");
 
+	bool has_rov_storage_flags = true;
+
 	// Check texture format support before we try to create them.
 	for (u32 fmt = static_cast<u32>(GSTexture::Format::Color); fmt < static_cast<u32>(GSTexture::Format::PrimID); fmt++)
 	{
 		const VkFormat vkfmt = LookupNativeFormat(static_cast<GSTexture::Format>(fmt));
-		const VkFormatFeatureFlags bits =
-			(static_cast<GSTexture::Format>(fmt) == GSTexture::Format::DepthStencil) ?
-				(VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) :
-				(VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+		VkFormatFeatureFlags bits = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+
+		if (static_cast<GSTexture::Format>(fmt) == GSTexture::Format::DepthStencil)
+			bits |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		else
+			bits |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
 
 		VkFormatProperties props = {};
 		vkGetPhysicalDeviceFormatProperties(m_physical_device, vkfmt, &props);
@@ -2859,6 +2900,9 @@ bool GSDeviceVK::CheckFeatures()
 				fmt, static_cast<unsigned>(vkfmt), props.optimalTilingFeatures, bits);
 			return false;
 		}
+
+		if (GSTexture::IsShaderWriteFormat(static_cast<GSTexture::Format>(fmt)))
+			has_rov_storage_flags &= ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0);
 	}
 
 	m_features.dxt_textures = m_device_features.textureCompressionBC;
@@ -2873,9 +2917,13 @@ bool GSDeviceVK::CheckFeatures()
 	}
 
 	m_max_texture_size = m_device_properties.limits.maxImageDimension2D;
+	m_max_framebuffer_width = m_device_properties.limits.maxFramebufferWidth;
+	m_max_framebuffer_height = m_device_properties.limits.maxFramebufferHeight;
 
 	m_features.rov = m_optional_extensions.vk_ext_fragment_shader_interlock &&
-	                 m_device_features.fragmentStoresAndAtomics;
+	                 m_device_features.fragmentStoresAndAtomics &&
+	                 has_rov_storage_flags &&
+	                 !m_features.framebuffer_fetch;
 
 	return true;
 }
@@ -2959,15 +3007,15 @@ VkFormat GSDeviceVK::LookupNativeFormat(GSTexture::Format format) const
 		VK_FORMAT_D32_SFLOAT;
 }
 
-GSTexture* GSDeviceVK::CreateSurface(GSTexture::Type type, int width, int height, int levels, GSTexture::Format format)
+GSTexture* GSDeviceVK::CreateSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format)
 {
-	std::unique_ptr<GSTexture> tex = GSTextureVK::Create(type, format, width, height, levels);
+	std::unique_ptr<GSTexture> tex = GSTextureVK::Create(usage, format, width, height, levels);
 	if (!tex)
 	{
 		// We're probably out of vram, try flushing the command buffer to release pending textures.
 		PurgePool();
 		ExecuteCommandBufferAndRestartRenderPass(true, "Couldn't allocate texture.");
-		tex = GSTextureVK::Create(type, format, width, height, levels);
+		tex = GSTextureVK::Create(usage, format, width, height, levels);
 	}
 
 	return tex.release();
@@ -3001,7 +3049,7 @@ void GSDeviceVK::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r,
 				return;
 
 			// Do an attachment clear.
-			const bool depth = (dTexVK->GetType() == GSTexture::Type::DepthStencil);
+			const bool depth = dTexVK->IsDepthStencil();
 			OMSetRenderTargets(depth ? nullptr : dTexVK, depth ? dTexVK : nullptr, dst_rect);
 			BeginRenderPassForStretchRect(
 				dTexVK, dst_rect, GSVector4i(destX, destY, destX + r.width(), destY + r.height()));
@@ -3212,14 +3260,13 @@ void GSDeviceVK::BeginRenderPassForStretchRect(
 		(allow_discard && dst_rc.eq(dtex_rc)) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : GetLoadOpForTexture(dTex);
 	dTex->SetState(GSTexture::State::Dirty);
 
-	if (dTex->GetType() == GSTexture::Type::DepthStencil)
+	if (dTex->IsDepthStencil())
 	{
 		if (load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
 			BeginClearRenderPass(m_utility_depth_render_pass_clear, dtex_rc, dTex->GetClearDepth(), 0);
 		else
 			BeginRenderPass((load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE) ? m_utility_depth_render_pass_discard :
-																		   m_utility_depth_render_pass_load,
-				dtex_rc);
+			                                                               m_utility_depth_render_pass_load, dtex_rc);
 	}
 	else if (dTex->GetFormat() == GSTexture::Format::Color)
 	{
@@ -3227,8 +3274,7 @@ void GSDeviceVK::BeginRenderPassForStretchRect(
 			BeginClearRenderPass(m_utility_color_render_pass_clear, dtex_rc, dTex->GetClearColor());
 		else
 			BeginRenderPass((load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE) ? m_utility_color_render_pass_discard :
-																		   m_utility_color_render_pass_load,
-				dtex_rc);
+			                                                               m_utility_color_render_pass_load, dtex_rc);
 	}
 	else
 	{
@@ -3260,7 +3306,7 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
 	SetPipeline(pipeline);
 
 	const bool is_present = (!dTex);
-	const bool depth = (dTex && dTex->GetType() == GSTexture::Type::DepthStencil);
+	const bool depth = (dTex && dTex->IsDepthStencil());
 	const GSVector2i size(is_present ? GSVector2i(GetWindowWidth(), GetWindowHeight()) : dTex->GetSize());
 	const GSVector4i dtex_rc(0, 0, size.x, size.y);
 	const GSVector4i dst_rc(GSVector4i(dRect).rintersect(dtex_rc));
@@ -3324,10 +3370,9 @@ void GSDeviceVK::BlitRect(GSTexture* sTex, const GSVector4i& sRect, u32 sLevel, 
 	if (m_tfx_textures[0] == sTexVK)
 		PSSetShaderResource(0, nullptr, false);
 
-	pxAssert(
-		(sTexVK->GetType() == GSTexture::Type::DepthStencil) == (dTexVK->GetType() == GSTexture::Type::DepthStencil));
+	pxAssert(sTexVK->IsDepthStencil() == dTexVK->IsDepthStencil());
 	const VkImageAspectFlags aspect =
-		(sTexVK->GetType() == GSTexture::Type::DepthStencil) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+		sTexVK->IsDepthStencil() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
 	const VkImageBlit ib{{aspect, sLevel, 0u, 1u}, {{sRect.left, sRect.top, 0}, {sRect.right, sRect.bottom, 1}},
 		{aspect, dLevel, 0u, 1u}, {{dRect.left, dRect.top, 0}, {dRect.right, dRect.bottom, 1}}};
 
@@ -3931,7 +3976,8 @@ VkShaderModule GSDeviceVK::GetUtilityFragmentShader(const std::string& source, c
 
 bool GSDeviceVK::CreateNullTexture()
 {
-	m_null_texture = GSTextureVK::Create(GSTexture::Type::RenderTarget, GSTexture::Format::Color, 1, 1, 1);
+	GSTexture::Usage null_usage = m_features.rov ? GSTexture::ShaderWriteTarget : GSTexture::FeedbackTarget;
+	m_null_texture = GSTextureVK::Create(null_usage, GSTexture::Format::Color, 1, 1, 1);
 	if (!m_null_texture)
 		return false;
 
@@ -5409,7 +5455,7 @@ void GSDeviceVK::SetLineWidth(float width)
 	m_dirty_flags |= DIRTY_FLAG_LINE_WIDTH;
 }
 
-void GSDeviceVK::PSSetUnorderedAccess(GSTexture* rt, GSTexture* ds, bool write_rt, bool write_ds)
+void GSDeviceVK::PSSetROVs(GSTexture* rt, GSTexture* ds, bool write_rt, bool write_ds)
 {
 	GSTextureVK* vkRt = static_cast<GSTextureVK*>(rt);
 	GSTextureVK* vkDs = static_cast<GSTextureVK*>(ds);
@@ -6208,7 +6254,7 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		{
 			config.colclip_update_area = config.drawarea;
 			EndRenderPass();
-			colclip_rt = static_cast<GSTextureVK*>(CreateRenderTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false));
+			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false));
 			if (!colclip_rt)
 			{
 				Console.Warning("VK: Failed to allocate ColorClip render target, aborting draw.");
@@ -6364,7 +6410,7 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		PSSetShaderResource(TFX_TEXTURE_DEPTH, nullptr, false);
 	}
 	
-	PSSetUnorderedAccess(draw_rt_rov, draw_ds_rov, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
+	PSSetROVs(draw_rt_rov, draw_ds_rov, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
 
 	OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
 

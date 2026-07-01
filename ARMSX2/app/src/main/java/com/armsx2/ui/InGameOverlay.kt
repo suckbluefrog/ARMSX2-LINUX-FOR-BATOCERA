@@ -59,8 +59,13 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -71,6 +76,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
@@ -83,14 +89,19 @@ import androidx.compose.ui.unit.sp
 import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import com.armsx2.EmuState
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import com.armsx2.CustomCovers
 import com.armsx2.GameInfo
 import com.armsx2.Main
+import com.armsx2.PlayTime
 import com.armsx2.R
 import com.armsx2.config.ConfigStore
 import com.armsx2.config.LiveGsApplyQueue
 import com.armsx2.config.Settings
 import com.armsx2.config.SettingsScope
 import com.armsx2.ui.settings.AudioTab
+import com.armsx2.ui.settings.controllerFocusable
 import com.armsx2.ui.settings.FixesTab
 import com.armsx2.ui.settings.HotkeysTab
 import com.armsx2.ui.settings.NetworkTab
@@ -101,6 +112,7 @@ import com.armsx2.ui.settings.PerformanceTab
 import com.armsx2.ui.settings.RecompilerTab
 import com.armsx2.ui.settings.RendererTab
 import com.armsx2.ui.settings.SettingsControllerNav
+import com.armsx2.ui.settings.SkinsTab
 import kr.co.iefriends.pcsx2.NativeApp
 
 /**
@@ -139,6 +151,7 @@ object InGameOverlay {
         data object AchievementsLogin : State()
         data object Achievements : State()
         data object HardcoreEnableConfirm : State()
+        data object HardcoreDisableConfirm : State()
         data object HardcoreSaveStateBlocked : State()
     }
 
@@ -162,8 +175,10 @@ object InGameOverlay {
         Network("Network"),
         Overlay("Overlay"),
         Pad("Pad"),
+        Skins("Skins"),
         Hotkeys("Hotkeys"),
         Recompiler("JIT"),
+        Info("Info"),
     }
     private val currentTab = mutableStateOf(Tab.PlayingNow)
 
@@ -295,8 +310,186 @@ object InGameOverlay {
         } else {
             applySafeLiveDelta(previous, updated)
         }
+        // Per-game scope: also regenerate the sparse, portable game-settings INI
+        // (upstream FullscreenUI style) for the running game. The live apply
+        // already happened above; this only refreshes the on-disk overrides so
+        // they're visible/portable and load as the game layer on next boot.
+        if (settingsScope.value == SettingsScope.Game && currentSerial.value != null &&
+            Main.eState.value != EmuState.STOPPED) {
+            updated.writeGameSettingsIni(ConfigStore.loadGlobal())
+        }
         frameLimitOn.value = updated.frameLimitEnable
         osdShown.value = anyOsdElementEnabled(updated)
+    }
+
+    /** Reset the currently-shown settings tier to its baseline. Global scope →
+     *  restore Settings() defaults. Game scope → drop this game's per-game
+     *  overrides so it inherits global again (and, if a VM is running, clear the
+     *  game's portable INI via an empty diff). Applies live like any edit. */
+    fun resetCurrentScope() {
+        // Pad feel/stick-modes, system hotkeys, and UI-size live OUTSIDE the Settings
+        // object (Main.prefs / UiScale state) and are GLOBAL-ONLY — there is no per-game
+        // tier for them. Reset them on EITHER scope's reset: otherwise a deadzone / stick
+        // mode / hotkey / UI-size change made on those tabs can't be undone from the
+        // per-game "Reset this game to global" (the user is looking right at the reset
+        // button on that tab). The reset is confirm-tap-gated, so this is deliberate.
+        com.armsx2.input.ControllerMappings.resetTunables()
+        com.armsx2.input.ControllerMappings.clearAllHotkeys()
+        UiScale.resetToDefaults()
+
+        val serial = currentSerial.value
+        if (settingsScope.value == SettingsScope.Game && serial != null) {
+            ConfigStore.clearOverrides(serial)
+            val resolved = ConfigStore.loadGlobal()
+            val previous = settingsState.value
+            settingsState.value = resolved
+            if (Main.eState.value == EmuState.STOPPED) {
+                resolved.applyTo()
+            } else {
+                applySafeLiveDelta(previous, resolved)
+                // Empty diff → gameIniCommitWrite deletes the running game's INI.
+                resolved.writeGameSettingsIni(ConfigStore.loadGlobal())
+            }
+            frameLimitOn.value = resolved.frameLimitEnable
+            osdShown.value = anyOsdElementEnabled(resolved)
+        } else {
+            saveSettings(Settings())
+        }
+    }
+
+    /** Tabs that have settings to reset via the per-tab Reset button. PlayingNow has
+     *  only session actions; Skins/Info are managed/read-only. */
+    private fun currentTabHasReset(): Boolean = when (currentTab.value) {
+        Tab.PlayingNow, Tab.Skins, Tab.Info -> false
+        else -> true
+    }
+
+    /** Reset ONLY the current tab's settings, leaving the other tabs untouched. The
+     *  common ask: "let me reset the Pad tab without wiping all my game settings."
+     *  Settings-backed tabs reset just their own fields — to Settings() defaults in
+     *  Global scope, or to the resolved-global value in Game scope (so the game
+     *  re-inherits global for those fields only). Pad / Hotkeys / Overlay also reset
+     *  their GLOBAL-ONLY external state (stick feel + rumble, hotkeys, UI scale), which
+     *  has no per-game tier — same as resetCurrentScope handles them. Applies live like
+     *  any edit. NOTE: keep each tab's field list in sync with its *Tab.kt composable. */
+    fun resetCurrentTab() {
+        val base = if (settingsScope.value == SettingsScope.Game && currentSerial.value != null)
+            ConfigStore.loadGlobal() else Settings()
+        val cur = settingsState.value
+        val updated: Settings? = when (currentTab.value) {
+            Tab.Performance -> cur.copy(
+                eeClampMode = base.eeClampMode, eeCycleRate = base.eeCycleRate,
+                eeCycleSkip = base.eeCycleSkip, eeFpuRoundMode = base.eeFpuRoundMode,
+                enableFastBoot = base.enableFastBoot, enableGameFixes = base.enableGameFixes,
+                fastCDVD = base.fastCDVD, fpsLimit = base.fpsLimit, frameSkip = base.frameSkip,
+                framerateNtsc = base.framerateNtsc, frameratePal = base.frameratePal,
+                intcStat = base.intcStat, mtvu = base.mtvu,
+                nominalSpeedPercent = base.nominalSpeedPercent,
+                skipDuplicateFrames = base.skipDuplicateFrames, vu0RoundMode = base.vu0RoundMode,
+                vu1Instant = base.vu1Instant, vu1RoundMode = base.vu1RoundMode,
+                vuClampMode = base.vuClampMode, vuDeferredWrites = base.vuDeferredWrites,
+                vuFlagHack = base.vuFlagHack, vuNeonFusions = base.vuNeonFusions,
+                vuSkipStallSim = base.vuSkipStallSim, waitLoop = base.waitLoop,
+            )
+            Tab.Renderer -> cur.copy(
+                renderer = base.renderer,
+                accurateBlendingUnit = base.accurateBlendingUnit, adrenoFbFetch = base.adrenoFbFetch,
+                aspectRatio = base.aspectRatio, deinterlaceMode = base.deinterlaceMode,
+                dumpReplaceableTextures = base.dumpReplaceableTextures, gpuProfile = base.gpuProfile,
+                hardwareDownloadMode = base.hardwareDownloadMode, hwAa1 = base.hwAa1,
+                hwAat = base.hwAat, hwMipmap = base.hwMipmap, hwRov = base.hwRov,
+                loadTextureReplacements = base.loadTextureReplacements,
+                loadTextureReplacementsAsync = base.loadTextureReplacementsAsync,
+                maxAnisotropy = base.maxAnisotropy,
+                osdShowTextureReplacements = base.osdShowTextureReplacements,
+                precacheTextureReplacements = base.precacheTextureReplacements,
+                shadeBoost = base.shadeBoost, shadeBoostBrightness = base.shadeBoostBrightness,
+                shadeBoostContrast = base.shadeBoostContrast, shadeBoostGamma = base.shadeBoostGamma,
+                shadeBoostSaturation = base.shadeBoostSaturation, textureFiltering = base.textureFiltering,
+                texturePreloading = base.texturePreloading, triFilter = base.triFilter,
+                tvShader = base.tvShader, upscaleFloat = base.upscaleFloat, vsyncEnable = base.vsyncEnable,
+            )
+            Tab.Fixes -> cur.copy(
+                alignSprite = base.alignSprite, antiBlur = base.antiBlur, autoFlush = base.autoFlush,
+                autoFlushSw = base.autoFlushSw, bilinearUpscale = base.bilinearUpscale,
+                cpuClutRender = base.cpuClutRender, cpuFramebufferConversion = base.cpuFramebufferConversion,
+                cpuSpriteRenderBw = base.cpuSpriteRenderBw, cpuSpriteRenderLevel = base.cpuSpriteRenderLevel,
+                disableDepthEmulation = base.disableDepthEmulation,
+                disableFramebufferFetch = base.disableFramebufferFetch,
+                disableInterlaceOffset = base.disableInterlaceOffset,
+                disablePartialInvalidation = base.disablePartialInvalidation,
+                disableRenderFixes = base.disableRenderFixes, disableSafeFeatures = base.disableSafeFeatures,
+                disableShaderCache = base.disableShaderCache,
+                disableVertexShaderExpand = base.disableVertexShaderExpand, dithering = base.dithering,
+                drawBuffering = base.drawBuffering, estimateTextureRegion = base.estimateTextureRegion,
+                forceEvenSpritePosition = base.forceEvenSpritePosition,
+                gpuPaletteConversion = base.gpuPaletteConversion, gpuTargetClut = base.gpuTargetClut,
+                halfPixelOffset = base.halfPixelOffset, hwAccurateAlphaTest = base.hwAccurateAlphaTest,
+                integerScaling = base.integerScaling, limit24BitDepth = base.limit24BitDepth,
+                manualUserHacks = base.manualUserHacks, mergeSprite = base.mergeSprite,
+                mipmapSw = base.mipmapSw, nativeScaling = base.nativeScaling,
+                overrideTextureBarriers = base.overrideTextureBarriers, preloadFrameData = base.preloadFrameData,
+                readTargetsWhenClosing = base.readTargetsWhenClosing, roundSprite = base.roundSprite,
+                screenOffsets = base.screenOffsets, showOverscan = base.showOverscan,
+                skipDrawEnd = base.skipDrawEnd, skipDrawStart = base.skipDrawStart,
+                spinCpuReadbacks = base.spinCpuReadbacks, spinGpuReadbacks = base.spinGpuReadbacks,
+                swThreads = base.swThreads, swThreadsHeight = base.swThreadsHeight,
+                syncToHostRefresh = base.syncToHostRefresh, textureInsideRt = base.textureInsideRt,
+                textureOffsetX = base.textureOffsetX, textureOffsetY = base.textureOffsetY,
+                unscaledPaletteDraw = base.unscaledPaletteDraw, useBlitSwapChain = base.useBlitSwapChain,
+                vsyncQueueSize = base.vsyncQueueSize,
+            )
+            Tab.Audio -> cur.copy(
+                audioBufferMs = base.audioBufferMs, audioFastForwardVolume = base.audioFastForwardVolume,
+                audioMuted = base.audioMuted, audioOutputLatencyMs = base.audioOutputLatencyMs,
+                audioTimeStretch = base.audioTimeStretch, audioVolume = base.audioVolume,
+                spu2NeonReverb = base.spu2NeonReverb,
+            )
+            Tab.Patches -> cur.copy(
+                enableCheats = base.enableCheats,
+                enableNoInterlacingPatches = base.enableNoInterlacingPatches,
+                enablePatches = base.enablePatches, enableWideScreenPatches = base.enableWideScreenPatches,
+                hostFs = base.hostFs,
+            )
+            Tab.Network -> cur.copy(
+                dev9AutoGateway = base.dev9AutoGateway, dev9AutoMask = base.dev9AutoMask,
+                dev9Dns1 = base.dev9Dns1, dev9Dns2 = base.dev9Dns2, dev9EthApi = base.dev9EthApi,
+                dev9EthDevice = base.dev9EthDevice, dev9EthEnable = base.dev9EthEnable,
+                dev9EthLogDhcp = base.dev9EthLogDhcp, dev9EthLogDns = base.dev9EthLogDns,
+                dev9Gateway = base.dev9Gateway, dev9HddEnable = base.dev9HddEnable,
+                dev9HddFile = base.dev9HddFile, dev9InterceptDhcp = base.dev9InterceptDhcp,
+                dev9Mask = base.dev9Mask, dev9ModeDns1 = base.dev9ModeDns1,
+                dev9ModeDns2 = base.dev9ModeDns2, dev9Ps2Ip = base.dev9Ps2Ip,
+            )
+            Tab.Recompiler -> cur.copy(
+                enableFastmem = base.enableFastmem, recEE = base.recEE, recIOP = base.recIOP,
+                recVU0 = base.recVU0, recVU1 = base.recVU1,
+            )
+            Tab.Overlay -> {
+                UiScale.resetToDefaults()
+                cur.copy(
+                    osdShowCpu = base.osdShowCpu, osdShowFps = base.osdShowFps,
+                    osdShowFrameTimes = base.osdShowFrameTimes, osdShowGpu = base.osdShowGpu,
+                    osdShowGsStats = base.osdShowGsStats, osdShowHardwareInfo = base.osdShowHardwareInfo,
+                    osdShowResolution = base.osdShowResolution, osdShowSpeed = base.osdShowSpeed,
+                    osdShowVersion = base.osdShowVersion, osdShowVps = base.osdShowVps,
+                )
+            }
+            Tab.Pad -> {
+                // Stick feel/deadzone/modes + rumble live OUTSIDE Settings (Main.prefs);
+                // mirror what resetCurrentScope does for the pad. Button binds + macros
+                // keep their own per-row resets, so this won't nuke careful mappings.
+                com.armsx2.input.ControllerMappings.resetTunables()
+                com.armsx2.input.ControllerMappings.setRumbleEnabled(true)
+                null
+            }
+            Tab.Hotkeys -> {
+                com.armsx2.input.ControllerMappings.clearAllHotkeys()
+                null
+            }
+            else -> null // PlayingNow / Skins / Info — nothing persisted to reset
+        }
+        if (updated != null) saveSettings(updated)
     }
 
     private fun anyOsdElementEnabled(settings: Settings): Boolean =
@@ -307,7 +500,9 @@ object InGameOverlay {
             settings.osdShowGpu ||
             settings.osdShowResolution ||
             settings.osdShowGsStats ||
-            settings.osdShowFrameTimes
+            settings.osdShowFrameTimes ||
+            settings.osdShowHardwareInfo ||
+            settings.osdShowVersion
 
     private fun withAllOsdElements(settings: Settings, enabled: Boolean): Settings =
         settings.copy(
@@ -319,6 +514,8 @@ object InGameOverlay {
             osdShowResolution = enabled,
             osdShowGsStats = enabled,
             osdShowFrameTimes = enabled,
+            osdShowHardwareInfo = enabled,
+            osdShowVersion = enabled,
         )
 
     private fun syncQuickTogglesFromSettings(settings: Settings) {
@@ -336,13 +533,26 @@ object InGameOverlay {
         if (previous.frameLimitEnable != updated.frameLimitEnable) {
             NativeApp.setSetting("EmuCore/GS", "FrameLimitEnable", "bool", updated.frameLimitEnable.toString())
             NativeApp.speedhackLimitermode(if (updated.frameLimitEnable) 0 else 3)
+            // This limiter write supersedes a latched fast-forward toggle; clear it so
+            // the next FF-toggle press starts fresh instead of reading a stale "on".
+            Main.fastForwardToggleActive = false
         }
 
-        // Speed Limit / Custom FPS — setNominalSpeed is a light direct re-pace
-        // (sets EmuConfig.NominalScalar + UpdateTargetSpeed), no VM park, so it's
-        // safe on this in-game delta path. Persistence is handled by ConfigStore.
+        // Speed Limit % (emulation speed → NominalScalar) and Frame Rate Control (GS
+        // present rate) are INDEPENDENT light re-applies, no VM park — safe on
+        // this delta path. Persistence is handled by ConfigStore.
         if (previous.nominalSpeedPercent != updated.nominalSpeedPercent)
             NativeApp.setNominalSpeed(updated.nominalSpeedPercent.coerceIn(10, 1000))
+        if (previous.fpsLimit != updated.fpsLimit)
+            NativeApp.setFpsCap(updated.fpsLimit.coerceIn(0, 1000))
+
+        // Per-region NTSC/PAL framerate — applies live (NetherSX2-style) via a
+        // dedicated coalesced queue (it parks the VM to recompute the vsync pacer,
+        // so it can't run inline here). Persists to base inside the queue too.
+        if (previous.framerateNtsc != updated.framerateNtsc ||
+            previous.frameratePal != updated.frameratePal) {
+            LiveGsApplyQueue.applyFramerate(updated.framerateNtsc, updated.frameratePal)
+        }
 
         // Audio — SPU2 setters apply live to the open stream, no VM park.
         if (previous.audioVolume != updated.audioVolume)
@@ -398,6 +608,15 @@ object InGameOverlay {
             NativeApp.setAspectRatio(ratio)
         }
 
+        // Internal resolution (upscale) applies live to the GS via the queue — no
+        // VM park. The renderer BACKEND (OpenGL/Vulkan/Software) is restart-only,
+        // applied by Main.applyRendererPrefs on the next launch, so nothing live
+        // to do for it here.
+        if (previous.upscaleFloat != updated.upscaleFloat) {
+            Main.upscale.value = updated.upscaleFloat
+            com.armsx2.config.LiveGsApplyQueue.applyUpscale(updated.upscaleFloat)
+        }
+
         if (previous.loadTextureReplacements != updated.loadTextureReplacements)
             NativeApp.setSetting("EmuCore/GS", "LoadTextureReplacements", "bool", updated.loadTextureReplacements.toString())
         if (previous.loadTextureReplacementsAsync != updated.loadTextureReplacementsAsync)
@@ -444,6 +663,14 @@ object InGameOverlay {
         if (previous.osdShowFrameTimes != updated.osdShowFrameTimes) {
             NativeApp.setSetting("EmuCore/GS", "OsdShowFrameTimes", "bool", updated.osdShowFrameTimes.toString())
             NativeApp.osdShowFrameTimes(updated.osdShowFrameTimes)
+        }
+        if (previous.osdShowHardwareInfo != updated.osdShowHardwareInfo) {
+            NativeApp.setSetting("EmuCore/GS", "OsdShowHardwareInfo", "bool", updated.osdShowHardwareInfo.toString())
+            NativeApp.osdShowHardwareInfo(updated.osdShowHardwareInfo)
+        }
+        if (previous.osdShowVersion != updated.osdShowVersion) {
+            NativeApp.setSetting("EmuCore/GS", "OsdShowVersion", "bool", updated.osdShowVersion.toString())
+            NativeApp.osdShowVersion(updated.osdShowVersion)
         }
 
         // Renderer / hardware-fix / upscaling-fix changes apply live via a GS-only
@@ -502,7 +729,7 @@ object InGameOverlay {
                 if (dy != 0) modalSelection.value = (modalSelection.value + dy).coerceIn(0, 2)
                 return true
             }
-            is State.ResetConfirm, is State.HardcoreEnableConfirm -> {
+            is State.ResetConfirm, is State.HardcoreEnableConfirm, is State.HardcoreDisableConfirm -> {
                 val delta = if (dy != 0) dy else dx
                 if (delta != 0) modalSelection.value = (modalSelection.value + delta).coerceIn(0, 1)
                 return true
@@ -592,6 +819,14 @@ object InGameOverlay {
                 }
                 return true
             }
+            is State.HardcoreDisableConfirm -> {
+                if (modalSelection.value.coerceIn(0, 1) == 0) {
+                    enterState(State.Root)
+                } else {
+                    disableHardcoreMode()
+                }
+                return true
+            }
             is State.Achievements, is State.AchievementsLogin ->
                 return SettingsControllerNav.confirm()
             else -> return false
@@ -643,7 +878,7 @@ object InGameOverlay {
 
     private fun cycleTab(delta: Int) {
         val tabs = if (settingsOnly.value) {
-            listOf(Tab.Performance, Tab.Renderer, Tab.Fixes, Tab.Audio, Tab.Patches, Tab.Network, Tab.Overlay, Tab.Pad, Tab.Hotkeys, Tab.Recompiler)
+            listOf(Tab.Performance, Tab.Renderer, Tab.Fixes, Tab.Audio, Tab.Patches, Tab.Network, Tab.Overlay, Tab.Pad, Tab.Skins, Tab.Hotkeys, Tab.Recompiler, Tab.Info)
         } else {
             Tab.values().toList()
         }
@@ -674,11 +909,28 @@ object InGameOverlay {
     }
 
     private fun openSaveStates() {
-        enterState(if (hardcoreOn.value) State.HardcoreSaveStateBlocked else State.SaveStateSlots)
+        // Saving IS allowed in RetroAchievements hardcore (matches desktop PCSX2);
+        // only loading is blocked — see openLoadStates + native LoadStateFromSlot.
+        enterState(State.SaveStateSlots)
     }
 
     private fun openLoadStates() {
         enterState(if (hardcoreOn.value) State.HardcoreSaveStateBlocked else State.LoadStateSlots)
+    }
+
+    /** Open the pause overlay straight to the Save-State slot picker — used by the
+     *  on-screen SAVE button so the user picks which slot to save to (open() resets
+     *  to Root, so we enter the picker state right after). */
+    fun openSaveStatePicker() {
+        open()
+        openSaveStates()
+    }
+
+    /** Open the pause overlay straight to the Load-State slot picker — used by the
+     *  on-screen LOAD button so the user picks which slot to load from. */
+    fun openLoadStatePicker() {
+        open()
+        openLoadStates()
     }
 
     private fun swapDisc() {
@@ -730,7 +982,7 @@ object InGameOverlay {
         saveSettings(settingsState.value.copy(frameLimitEnable = !frameLimitOn.value))
     }
 
-    private fun editTouchLayout() {
+    fun editTouchLayout() {
         com.armsx2.ui.touch.TouchControls.ensureLoaded()
         com.armsx2.ui.touch.TouchControls.editMode.value = true
         closeKeepingState()
@@ -780,6 +1032,15 @@ object InGameOverlay {
         resetSystem()
     }
 
+    private fun disableHardcoreMode() {
+        // Drop to softcore. Unlike enable, this does NOT reset the game — it just
+        // flips the flag off for the rest of the session (matching the old
+        // immediate-toggle behaviour, now gated behind a confirm).
+        NativeApp.setHardcoreMode(false)
+        hardcoreOn.value = false
+        enterState(State.Root)
+    }
+
     /** Open the overlay. Pauses the VM. Safe to call when already open. */
     fun open() {
         if (WindowImpl.overlayVisible.value) return
@@ -799,7 +1060,10 @@ object InGameOverlay {
         state.value = State.Root
         playSelection.value = 0
         modalSelection.value = 0
-        currentTab.value = Tab.PlayingNow
+        // Reopen on the tab you were last on instead of snapping back to Play —
+        // currentTab persists on the overlay singleton, so just leave it. Less tedious
+        // when tuning a game and stepping in/out of the menu. First open = Play (the
+        // field's default). Quick-resume users can still tap Play / press B.
         SettingsControllerNav.clearSelection()
         resetSettingsAdjustGate()
         // Resolve the current game's serial first; scope and settings
@@ -841,7 +1105,10 @@ object InGameOverlay {
         state.value = State.Root
         playSelection.value = 0
         modalSelection.value = 0
-        currentTab.value = Tab.Performance
+        // Remember the last settings tab across opens instead of snapping back to
+        // the first one. PlayingNow isn't shown in settings-only mode, so only fall
+        // back to the first real tab when we're sitting on it (e.g. first open).
+        if (currentTab.value == Tab.PlayingNow) currentTab.value = Tab.Performance
         SettingsControllerNav.clearSelection()
         resetSettingsAdjustGate()
         currentSerial.value = null
@@ -860,7 +1127,8 @@ object InGameOverlay {
         state.value = State.Root
         playSelection.value = 0
         modalSelection.value = 0
-        currentTab.value = Tab.Performance
+        // Remember the last settings tab across opens (see openGlobalSettings).
+        if (currentTab.value == Tab.PlayingNow) currentTab.value = Tab.Performance
         SettingsControllerNav.clearSelection()
         resetSettingsAdjustGate()
         currentSerial.value = game.serial?.takeIf { it.isNotEmpty() }
@@ -970,6 +1238,13 @@ object InGameOverlay {
             // (RP6) still get the exact same 520/560dp, small screens scale down.
             val wideContent = state.value is State.Root &&
                 (settingsOnly.value || currentTab.value != Tab.PlayingNow)
+            // Portrait (the new Emulation Screen Orientation setting): this header is
+            // a landscape-first absolute layout — the top-left title column and the
+            // top-right brand/close cluster overlap on a narrow screen. In portrait
+            // we drop the decorative brand wordmark and tighten the content width so
+            // the title / RetroAchievements / ✕ stop colliding. Landscape unchanged.
+            val isPortrait = LocalConfiguration.current.orientation ==
+                android.content.res.Configuration.ORIENTATION_PORTRAIT
             // Headless poll keeps hardcore / renderer / rich-presence state in
             // sync even though the inline achievements panel is gone.
             AchievementsSync()
@@ -1016,7 +1291,9 @@ object InGameOverlay {
                     .padding(20.dp)
                     .then(if (wideContent) Modifier.fillMaxWidth(0.90f) else Modifier.widthIn(max = 520.dp).fillMaxWidth()),
             ) {
-                GameInfoHeader()
+                // In portrait reserve room on the right so the title / trophy
+                // button clear the ✕ (which floats at the top-right corner).
+                GameInfoHeader(modifier = if (isPortrait) Modifier.padding(end = 56.dp) else Modifier)
                 if (state.value is State.Root) {
                     Spacer(Modifier.height(12.dp))
                     TabStrip()
@@ -1037,19 +1314,16 @@ object InGameOverlay {
                         Spacer(Modifier.height(4.dp))
                         ScopeToggle()
                     }
+                    if (currentTab.value != Tab.PlayingNow) {
+                        Spacer(Modifier.height(4.dp))
+                        ResetScopeButton()
+                    }
                     Spacer(Modifier.height(6.dp))
                     // weight(1f) gives RootTabs the remaining vertical
                     // space, bounding Performance/Renderer's verticalScroll
                     // so it actually scrolls instead of expanding off-screen.
                     Box(modifier = Modifier.weight(1f)) {
                         RootTabs()
-                        if (settingsTabActive()) {
-                            SettingsScrollHint(
-                                modifier = Modifier
-                                    .align(Alignment.BottomEnd)
-                                    .padding(end = 4.dp, bottom = 4.dp),
-                            )
-                        }
                     }
                 }
                 else if (state.value is State.Achievements) {
@@ -1069,10 +1343,16 @@ object InGameOverlay {
                             },
                             onHardcoreToggle = {
                                 if (hardcoreOn.value) {
-                                    NativeApp.setHardcoreMode(false)
-                                    hardcoreOn.value = false
+                                    // Gate the disable behind a confirm — users were
+                                    // turning hardcore off by accident with a single
+                                    // tap and silently losing challenge-mode unlocks.
+                                    enterState(State.HardcoreDisableConfirm)
                                 } else {
-                                    state.value = State.HardcoreEnableConfirm
+                                    // enterState (not a bare assignment) resets
+                                    // modalSelection to 0 so controller focus
+                                    // defaults to CANCEL — symmetric with the
+                                    // disable path and safe against a stale index.
+                                    enterState(State.HardcoreEnableConfirm)
                                 }
                             },
                         )
@@ -1086,18 +1366,55 @@ object InGameOverlay {
                     .padding(20.dp),
                 horizontalAlignment = Alignment.End,
             ) {
-                // Dedicated close button so touch users don't have to tap the
-                // dim backdrop (easy to hit by accident) to leave the overlay.
-                Box(
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(Color.White.copy(alpha = 0.12f))
-                        .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(20.dp))
-                        .clickable { closeAndResume() },
-                    contentAlignment = Alignment.Center,
+                // Top-right controls. The green ▶ only appears when configuring a
+                // game's settings via long-press (settingsOnly + a previewGame, no
+                // game running yet): there it BOOTS that game with the settings just
+                // edited. While actually in-game it's hidden — resuming is the red
+                // ✕'s job, so a second "play" button would be redundant. The ✕ is
+                // red and always resumes/closes the overlay.
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("✕", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    if (settingsOnly.value && previewGame.value != null) {
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(RoundedCornerShape(20.dp))
+                                .background(Color(0xFF2E7D32).copy(alpha = 0.92f))
+                                .border(1.dp, Color.White.copy(alpha = 0.30f), RoundedCornerShape(20.dp))
+                                .clickable {
+                                    val g = previewGame.value
+                                    closeKeepingState()
+                                    if (g != null) {
+                                        // Mirror the library card's launch path: hide the
+                                        // library so the new game's surface shows, and hand
+                                        // file:// (all-files) games a bare /storage path — the
+                                        // SAF FD bridge is only for content:// URIs, so a raw
+                                        // "file://…" arg fails to open.
+                                        WindowImpl.showLibrary.value = false
+                                        val arg = if (g.uri.scheme == "file")
+                                            (g.uri.path ?: g.uri.toString())
+                                        else g.uri.toString()
+                                        Main.launchGame(arg, g)
+                                    }
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("▶", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0xFFC62828).copy(alpha = 0.92f))
+                            .border(1.dp, Color.White.copy(alpha = 0.30f), RoundedCornerShape(20.dp))
+                            .clickable { closeAndResume() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("✕", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
@@ -1119,12 +1436,15 @@ object InGameOverlay {
             // Brand sits in the top-right-of-centre band: right of long game
             // titles (which start top-left) but left of the close button, so it
             // stops clashing with both. Anchored to the end edge for a stable
-            // gap from the ✕ across screen sizes.
-            BrandHeader(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 20.dp, end = 135.dp)
-            )
+            // gap from the ✕ across screen sizes. Hidden in portrait, where the
+            // narrow width makes its fixed 135dp inset overlap the title.
+            if (!isPortrait) {
+                BrandHeader(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 20.dp, end = 135.dp)
+                )
+            }
 
             // (The inline bottom-right achievements panel was removed — it's now
             // the header trophy button → dedicated achievements view, so the Play
@@ -1182,6 +1502,7 @@ object InGameOverlay {
                         )
                         is State.HardcoreSaveStateBlocked -> HardcoreBlockedBubble()
                         is State.HardcoreEnableConfirm -> Unit // rendered fullscreen below
+                        is State.HardcoreDisableConfirm -> Unit // rendered fullscreen below
                         is State.Achievements -> Unit // rendered in the top-left column
                         is State.Root -> Unit
                     }
@@ -1196,6 +1517,13 @@ object InGameOverlay {
             // user to know exactly what's about to happen.
             if (state.value is State.HardcoreEnableConfirm) {
                 HardcoreEnableConfirmFullscreen()
+            }
+            // Same PS2-BIOS-style fullscreen confirm for DISABLING hardcore.
+            // Turning hardcore off mid-session drops you to softcore for the
+            // rest of the run, so make the user explicitly confirm instead of
+            // letting a stray tap silently flip it.
+            if (state.value is State.HardcoreDisableConfirm) {
+                HardcoreDisableConfirmFullscreen()
             }
             } // displayCutoutPadding inner box
         }
@@ -1498,20 +1826,6 @@ object InGameOverlay {
         }
     }
 
-    @Composable
-    private fun SettingsScrollHint(modifier: Modifier = Modifier) {
-        Text(
-            "Scroll up/down and left/right to navigate",
-            color = Color.White.copy(alpha = 0.58f),
-            fontSize = 10.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            modifier = modifier
-                .background(Color.Black.copy(alpha = 0.28f))
-                .padding(horizontal = 6.dp, vertical = 2.dp),
-        )
-    }
-
     /** Active tab body. Rendered in the top-left column directly under
      *  TabStrip, so the strip and its entries stay visually attached.
      *  Width and horizontal padding come from the parent column. */
@@ -1534,10 +1848,188 @@ object InGameOverlay {
             Tab.Network -> NetworkTab(settingsState)
             Tab.Overlay -> OverlayTab(settingsState)
             Tab.Pad -> PadTab(settingsState)
+            Tab.Skins -> SkinsTab(settingsState)
             Tab.Hotkeys -> HotkeysTab(settingsState)
             Tab.Recompiler -> RecompilerTab(settingsState)
+            Tab.Info -> GameInfoTab()
         }
         SettingsControllerNav.end()
+    }
+
+    /** Game properties — Title / Serial / CRC / Region / Type / Path, each row
+     *  tap-to-copy. Uses the previewed (long-pressed) game, or the running game.
+     *  CRC comes from the game-list entry (works without booting). */
+    @Composable
+    private fun GameInfoTab() {
+        val game = previewGame.value ?: Main.currentGame.value
+        val context = androidx.compose.ui.platform.LocalContext.current
+        // getGameTitle now falls back to an on-demand disc scan when the native
+        // game-list cache misses (which it usually does — the Android library is
+        // scanned in Kotlin), so resolve the CRC OFF the UI thread to avoid
+        // janking the Info tab. The row stays hidden until it resolves.
+        var crc by remember(game?.uri) { mutableStateOf<String?>(null) }
+        LaunchedEffect(game?.uri) {
+            crc = withContext(Dispatchers.IO) {
+                runCatching {
+                    game?.uri?.let { uri ->
+                        NativeApp.getGameTitle(uri.toString()).split("|").getOrNull(2)
+                            ?.substringAfter('(', "")?.substringBefore(')')?.trim()
+                            ?.takeIf { it.isNotEmpty() && it != "00000000" }
+                    }
+                }.getOrNull()
+            }
+        }
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 4.dp),
+        ) {
+            InfoCopyRow("Title", game?.title)
+            InfoCopyRow("Serial", game?.serial)
+            InfoCopyRow("CRC", crc)
+            InfoCopyRow(
+                "Time Played",
+                PlayTime.formatPlayed(PlayTime.playedSeconds(game?.serial)).takeIf { it.isNotEmpty() },
+            )
+            InfoCopyRow(
+                "Last Played",
+                PlayTime.formatLastPlayed(PlayTime.lastPlayedMillis(game?.serial)).takeIf { it.isNotEmpty() },
+            )
+            InfoCopyRow("Region", game?.region)
+            InfoCopyRow("Type", game?.extension?.takeIf { it.isNotEmpty() })
+            InfoCopyRow("Path", game?.uri?.toString())
+            if (game != null) {
+                Spacer(Modifier.height(4.dp))
+                CustomCoverControls(game)
+                // Always show — some launchers report isRequestPinShortcutSupported=false
+                // even when they accept the pin, and others fall back to the legacy
+                // INSTALL_SHORTCUT broadcast; pin() tries both and toasts on real failure.
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Add to Home Screen",
+                    color = Colors.pasx2_blue,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            val ok = com.armsx2.HomeShortcuts.pin(context, game)
+                            android.widget.Toast.makeText(
+                                context,
+                                if (ok) "Added to home screen — check your launcher"
+                                else "Your launcher didn't accept the shortcut",
+                                android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                        .padding(vertical = 8.dp, horizontal = 4.dp),
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Tap a row to copy it to the clipboard.",
+                color = Color.White.copy(alpha = 0.5f),
+                fontSize = 11.sp,
+            )
+        }
+    }
+
+    /** Lets the user pick a local image as this game's cover — the only way to
+     *  give a cover to serial-less games (homebrew, ELF ports) the online repo
+     *  can't match. Writes via [CustomCovers]; the library shelf picks it up. */
+    @Composable
+    private fun CustomCoverControls(game: GameInfo) {
+        val context = LocalContext.current
+        val scope = rememberCoroutineScope()
+        val hasCustom = remember(game.uri, CustomCovers.version.value) { mutableStateOf(false) }
+        LaunchedEffect(game.uri, CustomCovers.version.value) {
+            hasCustom.value = withContext(Dispatchers.IO) { CustomCovers.fileFor(context, game) != null }
+        }
+        val picker = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument(),
+        ) { uri ->
+            if (uri != null) {
+                // The copy streams a possibly-multi-MB image over the SAF FD bridge,
+                // so do it off the main thread (matches the read side); the version
+                // bump inside set() re-resolves the shelf + this panel.
+                scope.launch {
+                    val ok = withContext(Dispatchers.IO) { CustomCovers.set(context, game, uri) }
+                    android.widget.Toast.makeText(
+                        context,
+                        if (ok) "Custom cover set" else "Couldn't set cover",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp, horizontal = 4.dp)) {
+            Text("Cover", color = Colors.pasx2_blue, fontSize = 11.sp)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CoverPill(if (hasCustom.value) "Change cover" else "Set custom cover") {
+                    picker.launch(arrayOf("image/*"))
+                }
+                if (hasCustom.value) {
+                    CoverPill("Remove") {
+                        scope.launch {
+                            withContext(Dispatchers.IO) { CustomCovers.remove(context, game) }
+                            android.widget.Toast.makeText(
+                                context, "Custom cover removed", android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Use your own image for this game's cover — handy for homebrew or discs with no serial.",
+                color = Color.White.copy(alpha = 0.5f),
+                fontSize = 11.sp,
+            )
+        }
+    }
+
+    @Composable
+    private fun CoverPill(label: String, onClick: () -> Unit) {
+        Box(
+            Modifier
+                .clip(RoundedCornerShape(16.dp))
+                .background(Colors.pasx2_blue.copy(alpha = 0.20f))
+                .border(1.dp, Colors.pasx2_blue.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+                .clickable(onClick = onClick)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+        ) {
+            Text(label, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+    }
+
+    @Composable
+    private fun InfoCopyRow(label: String, value: String?) {
+        if (value.isNullOrEmpty()) return
+        val ctx = LocalContext.current
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .clickable {
+                    runCatching {
+                        val cb = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        cb.setPrimaryClip(android.content.ClipData.newPlainText(label, value))
+                    }
+                    android.widget.Toast
+                        .makeText(ctx, "$label copied", android.widget.Toast.LENGTH_SHORT)
+                        .show()
+                }
+                .padding(vertical = 8.dp, horizontal = 4.dp),
+        ) {
+            Text(
+                label,
+                color = Colors.pasx2_blue,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(value, color = Color.White, fontSize = 13.sp)
+        }
     }
 
     /** Horizontal tab chip strip. Active tab gets PS2-blue underline +
@@ -1553,7 +2045,7 @@ object InGameOverlay {
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             val tabs = if (settingsOnly.value) {
-                listOf(Tab.Performance, Tab.Renderer, Tab.Fixes, Tab.Audio, Tab.Patches, Tab.Network, Tab.Overlay, Tab.Pad, Tab.Hotkeys, Tab.Recompiler)
+                listOf(Tab.Performance, Tab.Renderer, Tab.Fixes, Tab.Audio, Tab.Patches, Tab.Network, Tab.Overlay, Tab.Pad, Tab.Skins, Tab.Hotkeys, Tab.Recompiler, Tab.Info)
             } else {
                 Tab.values().toList()
             }
@@ -1619,14 +2111,28 @@ object InGameOverlay {
                 active = settingsScope.value == SettingsScope.Global,
                 enabled = true,
                 modifier = Modifier.weight(1f),
-            ) { settingsScope.value = SettingsScope.Global }
+            ) {
+                if (settingsScope.value != SettingsScope.Global) {
+                    // Switching tiers must RE-HYDRATE the edited Settings from
+                    // the tier being switched TO. Without this the prior tier's
+                    // values stay in settingsState and the next edit persists
+                    // them into the wrong tier (the global ↔ per-game bleed).
+                    settingsScope.value = SettingsScope.Global
+                    settingsState.value = ConfigStore.loadGlobal()
+                    syncQuickTogglesFromSettings(settingsState.value)
+                }
+            }
             ScopeHalf(
                 label = if (serial != null) "Game · $serial" else "Game",
                 active = settingsScope.value == SettingsScope.Game,
                 enabled = gameEnabled,
                 modifier = Modifier.weight(1f),
             ) {
-                if (gameEnabled) settingsScope.value = SettingsScope.Game
+                if (gameEnabled && settingsScope.value != SettingsScope.Game) {
+                    settingsScope.value = SettingsScope.Game
+                    settingsState.value = ConfigStore.resolveForGame(currentSerial.value)
+                    syncQuickTogglesFromSettings(settingsState.value)
+                }
             }
         }
     }
@@ -1667,6 +2173,88 @@ object InGameOverlay {
         }
     }
 
+    /** Scope-aware "reset to defaults" row, shown under the scope toggle. Two buttons:
+     *  "Reset Tab" clears only the tab you're looking at (so e.g. resetting the Pad tab
+     *  no longer wipes every other game setting), and "Reset All"/"Reset Game" does the
+     *  whole-tier reset (the old behaviour). Each requires a confirming second tap;
+     *  arming one disarms the other. The per-tab button hides on tabs with nothing to
+     *  reset (Play/Skins/Info). */
+    @Composable
+    private fun ResetScopeButton() {
+        val tabArmed = remember(currentTab.value, settingsScope.value, settingsOnly.value) {
+            mutableStateOf(false)
+        }
+        val allArmed = remember(currentTab.value, settingsScope.value, settingsOnly.value) {
+            mutableStateOf(false)
+        }
+        val game = settingsScope.value == SettingsScope.Game && currentSerial.value != null
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            if (currentTabHasReset()) {
+                ResetChip(
+                    modifier = Modifier.weight(1f),
+                    id = "settings-reset-tab",
+                    label = if (tabArmed.value) "Tap to confirm" else "Reset Tab",
+                    armed = tabArmed.value,
+                ) {
+                    if (tabArmed.value) {
+                        resetCurrentTab(); tabArmed.value = false
+                    } else {
+                        tabArmed.value = true; allArmed.value = false
+                    }
+                }
+            }
+            ResetChip(
+                modifier = Modifier.weight(1f),
+                id = "settings-reset-all",
+                label = when {
+                    allArmed.value -> "Tap to confirm"
+                    game -> "Reset Game"
+                    else -> "Reset All"
+                },
+                armed = allArmed.value,
+            ) {
+                if (allArmed.value) {
+                    resetCurrentScope(); allArmed.value = false
+                } else {
+                    allArmed.value = true; tabArmed.value = false
+                }
+            }
+        }
+    }
+
+    /** One pill in the reset row. Red when armed (awaiting confirm tap). */
+    @Composable
+    private fun RowScope.ResetChip(
+        modifier: Modifier,
+        id: String,
+        label: String,
+        armed: Boolean,
+        onClick: () -> Unit,
+    ) {
+        Box(
+            modifier = modifier
+                .clip(RoundedCornerShape(4.dp))
+                .background(Color(0xFF1A1A1A))
+                .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(4.dp))
+                .height(20.dp)
+                .controllerFocusable(id, onConfirm = onClick)
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                label,
+                color = if (armed) Color(0xFFE53935) else Colors.pasx2_blue,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+
     /** Playing Now — pause-menu actions laid out as a 4-wide bubble grid.
      *  Three rows of four cells keep widths constant and fit without
      *  scrolling on phone landscape. Primary (Resume) and Danger (Close)
@@ -1682,7 +2270,9 @@ object InGameOverlay {
         // rows looked ragged / overran the bottom. Derive one height that fits all
         // 3 rows in the available space, clamped so cells aren't tiny or huge.
         val gap = 8.dp
-        val cellH = ((maxHeight - gap * 2) / 3).coerceIn(64.dp, 112.dp)
+        // Cap shorter (was 112) so the Play-tab bubbles stay compact on
+        // tall panels / small screens instead of ballooning to fill height.
+        val cellH = ((maxHeight - gap * 2) / 3).coerceIn(64.dp, 96.dp)
         Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
@@ -1701,7 +2291,7 @@ object InGameOverlay {
 	                BubbleButton(
 	                    "Save State",
 	                    LineAwesomeIcons.SaveSolid,
-	                    dim = hardcoreOn.value,
+	                    // Saving is allowed in hardcore — only loading is blocked.
 	                    selected = playSelection.value == 1,
 	                    modifier = Modifier.weight(1f),
 	                ) { activatePlaySelection(1) }
@@ -1998,7 +2588,7 @@ object InGameOverlay {
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                "Save states and load states are blocked while RetroAchievements Hardcore mode is active. Disable Hardcore from the Achievements panel to use them.",
+                "Loading save states is blocked while RetroAchievements Hardcore mode is active (saving is still allowed). Disable Hardcore from the Achievements panel to load.",
                 color = Color(0xFFEEDDDD),
                 fontSize = 11.sp,
             )
@@ -2057,7 +2647,7 @@ object InGameOverlay {
                 )
                 Spacer(Modifier.height(14.dp))
                 Text(
-                    "Hardcore mode disables save states, load states, and cheats. Achievements unlocked while hardcore is active are recorded as such on RetroAchievements.",
+                    "Hardcore mode disables loading save states and cheats (you can still save, and widescreen/interlace patches still apply). Achievements unlocked while hardcore is active are recorded as such on RetroAchievements.",
                     color = Color(0xFFDDDDEE),
                     fontSize = 13.sp,
                 )
@@ -2085,6 +2675,79 @@ object InGameOverlay {
 	                        selected = modalSelection.value == 1,
 	                        modifier = Modifier.weight(1f),
 	                    ) { enableHardcoreMode() }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun HardcoreDisableConfirmFullscreen() {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xCC000000))
+                // Eat taps so background controls don't trigger.
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                ) {},
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier
+                    .width(420.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(Color(0xFF0A0A18))
+                    .border(2.dp, Color(0xFF8888AA), RoundedCornerShape(2.dp))
+                    .padding(2.dp)
+                    .border(1.dp, Color(0xFF333366), RoundedCornerShape(2.dp))
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    "DISABLE HARDCORE MODE",
+                    color = Color(0xFFFFCC66),
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 2.sp,
+                )
+                Spacer(Modifier.height(2.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(1.dp)
+                        .background(Color(0xFF8888AA)),
+                )
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    "This drops you to Softcore for the rest of this session. Achievements you unlock will no longer count as hardcore on RetroAchievements, and save states and cheats become available again.",
+                    color = Color(0xFFDDDDEE),
+                    fontSize = 13.sp,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "You can't turn hardcore back on without resetting the game.",
+                    color = Color(0xFFFFCC66),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(20.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    BiosLikeButton(
+                        label = "CANCEL",
+                        primary = false,
+                        selected = modalSelection.value == 0,
+                        modifier = Modifier.weight(1f),
+                    ) { enterState(State.Root) }
+                    BiosLikeButton(
+                        label = "DISABLE",
+                        primary = true,
+                        selected = modalSelection.value == 1,
+                        modifier = Modifier.weight(1f),
+                    ) { disableHardcoreMode() }
                 }
             }
         }

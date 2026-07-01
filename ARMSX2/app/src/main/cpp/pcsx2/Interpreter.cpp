@@ -17,7 +17,73 @@
 
 #include <float.h>
 
+#include "AndroidEEOpHist.h"
+#include "common/Console.h"
+#include "common/StringUtil.h"
+#include <string>
+
 using namespace R5900;		// for OPCODE and OpcodeImpl
+
+#if ARMSX2_ANDROID_EE_OPHIST
+namespace AndroidEEOpHist
+{
+	struct Hist { u64 primary[64]; u64 special[64]; u64 regimm[32]; u64 cop2[32]; u64 mmi[64]; };
+	static Hist s_hist[2] = {}; // [0]=STEP, [1]=INLINE
+	static u64 s_total = 0;
+	static u64 s_trapsCompiled = 0;
+	static const char* const s_pathName[2] = { "STEP", "INLINE" };
+
+	// Print every non-zero entry of one sub-table as " idx=count" (hex idx).
+	static void dumpTable(const char* path, const char* name, const u64* a, int n)
+	{
+		std::string line;
+		for (int i = 0; i < n; i++)
+			if (a[i])
+				line += StringUtil::StdStringFromFormat(" %02x=%llu", i, (unsigned long long)a[i]);
+		if (!line.empty())
+			Console.WriteLnFmt("@@ANDROID_EE_OPHIST@@ {} {}{}", path, name, line);
+	}
+
+	static void Dump()
+	{
+		for (int p = 0; p < 2; p++)
+		{
+			dumpTable(s_pathName[p], "primary", s_hist[p].primary, 64);
+			dumpTable(s_pathName[p], "special", s_hist[p].special, 64);
+			dumpTable(s_pathName[p], "regimm", s_hist[p].regimm, 32);
+			dumpTable(s_pathName[p], "cop2", s_hist[p].cop2, 32);
+			dumpTable(s_pathName[p], "mmi", s_hist[p].mmi, 64);
+		}
+		Console.WriteLnFmt("@@ANDROID_EE_OPHIST@@ traps_compiled={} total={}",
+			(unsigned long long)s_trapsCompiled, (unsigned long long)s_total);
+		memset(s_hist, 0, sizeof(s_hist));
+		s_total = 0;
+	}
+
+	void Record(int path, u32 op)
+	{
+		Hist& h = s_hist[path & 1];
+		const u32 primary = op >> 26;
+		h.primary[primary & 0x3f]++;
+		if (primary == 0x00) h.special[op & 0x3f]++;
+		else if (primary == 0x01) h.regimm[(op >> 16) & 0x1f]++;
+		else if (primary == 0x12) h.cop2[(op >> 21) & 0x1f]++;
+		else if (primary == 0x1c) h.mmi[op & 0x3f]++;
+		if (++s_total >= 8000000ull)
+			Dump();
+	}
+
+	void NoteTrapCompiled() { s_trapsCompiled++; }
+}
+
+// Inline-interp counting thunk (see header). recEmitInterpInline calls this instead
+// of the raw handler when the histogram is on; cpuRegs.code was set just before.
+void recOphistInlineThunk()
+{
+	AndroidEEOpHist::Record(1, cpuRegs.code);
+	R5900::GetInstruction(cpuRegs.code).interpret();
+}
+#endif
 
 extern int vu0branch, vu1branch;
 
@@ -302,6 +368,9 @@ void intExecuteOneInst()
 	const u32 thispc = cpuRegs.pc;
 	cpuRegs.pc += 4;
 	cpuRegs.code = memRead32(thispc);
+#if ARMSX2_ANDROID_EE_OPHIST
+	AndroidEEOpHist::Record(0, cpuRegs.code); // STEP (single-step) fallback profile
+#endif
 
 	const OPCODE& opcode = GetCurrentInstruction();
 	cpuBlockCycles += opcode.cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1));

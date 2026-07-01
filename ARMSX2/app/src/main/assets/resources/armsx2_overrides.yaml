@@ -23,3 +23,46 @@
 #     halfPixelOffset: 1
 #
 # Leave this file empty (just comments) when no overrides are needed.
+
+# Valkyrie Profile 2: Silmeria (NTSC-U) — on Adreno/mobile, upstream's upscaling
+# fixes (halfPixelOffset:4 + nativeScaling:2 Aggressive) cause a severe full-screen
+# render-target blowout when upscaling. On-device, the ONLY combination that renders
+# cleanly is Upscaling Fixes (nativeScaling) = Normal + Round Sprite = Half, with
+# Half-Pixel Offset OFF. gsHWFixes REPLACES the upstream list wholesale, so listing
+# ONLY these two drops upstream's halfPixelOffset:4 / textureInsideRT:1 / autoFlush:2
+# (which is exactly the maintainer's confirmed-working manual config). gameFixes
+# (VuAddSubHack) is omitted so it's inherited — that's what lets VP2 boot.
+SLUS-21452:
+  name: "Valkyrie Profile 2 - Silmeria"
+  gsHWFixes:
+    nativeScaling: 1   # Upscaling Fixes = Normal (upstream Aggressive 2 blows out on mobile)
+    roundSprite: 1     # Round Sprite = Half
+
+# LEGO Batman: The Videogame (all releases) — upstream sets halfPixelOffset:4 +
+# nativeScaling:1, which is right, but mobile (Vulkan AND OpenGL) still shows
+# upscaling artifacts until Round Sprite = Full. Add roundSprite:2; the other two are
+# re-listed because gsHWFixes REPLACES the upstream list.
+SCUS-10380:
+  name: "LEGO Batman - The Videogame"
+  gsHWFixes:
+    halfPixelOffset: 4 # (upstream) aligns post-processing
+    nativeScaling: 1   # (upstream) post-processing smoothness/position
+    roundSprite: 2     # Full — fixes upscaling artifacts on mobile
+SLUS-21785:
+  name: "LEGO Batman - The Videogame"
+  gsHWFixes:
+    halfPixelOffset: 4
+    nativeScaling: 1
+    roundSprite: 2     # Full — fixes upscaling artifacts on mobile
+SLES-55135:
+  name: "LEGO Batman - The Videogame"
+  gsHWFixes:
+    halfPixelOffset: 4
+    nativeScaling: 1
+    roundSprite: 2     # Full — fixes upscaling artifacts on mobile
+SLPS-25908:
+  name: "LEGO Batman - The Videogame"
+  gsHWFixes:
+    halfPixelOffset: 4
+    nativeScaling: 1
+    roundSprite: 2     # Full — fixes upscaling artifacts on mobile

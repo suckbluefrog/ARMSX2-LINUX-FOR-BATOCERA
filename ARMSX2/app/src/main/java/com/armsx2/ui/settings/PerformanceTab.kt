@@ -60,254 +60,291 @@ fun PerformanceTab(state: MutableState<Settings>) {
         }
         HelpText("Tap a preset. Optimal = safe for most games. Fast = aggressive (EE cycle skip + fast CDVD) for low-end devices; may glitch some. Tweaking any speedhack below un-highlights both (custom).")
         SettingsDivider()
-        IntSliderRow(
-            label = "EE Cycle Rate",
-            value = s.eeCycleRate,
-            min = -3,
-            max = 3,
-            description = "CPU overclock/underclock. Higher can help CPU-bound games but may break timing.",
-            valueFormatter = { rate ->
-                when (rate) {
-                    -3 -> "50%"
-                    -2 -> "60%"
-                    -1 -> "75%"
-                    0 -> "100%"
-                    1 -> "130%"
-                    2 -> "180%"
-                    3 -> "300%"
-                    else -> "$rate"
-                }
-            },
-            onChange = { apply(s.copy(eeCycleRate = it)) },
-        )
-        SettingsDivider()
-        IntSliderRow(
-            label = "EE Cycle Skip",
-            value = s.eeCycleSkip,
-            min = 0,
-            max = 3,
-            description = "Skips EE cycles for speed. Can cause stutter, physics bugs, or crashes.",
-            onChange = { apply(s.copy(eeCycleSkip = it)) },
-        )
-        SettingsDivider()
-        // Recompiler float-clamping accuracy (PCSX2 parity). Higher = more
-        // accurate float handling (fixes SPS / missing geometry / VU glitches)
-        // at a speed cost. Needs a recompiler reset, so restart the game.
-        SegmentedRow(
-            label = "EE/FPU Clamping",
-            options = listOf("None", "Normal", "Extra", "Full"),
-            selectedIndex = s.eeClampMode.coerceIn(0, 3),
-            description = "FPU overflow/rounding accuracy. Restart the game to apply.",
-            onChange = { apply(s.copy(eeClampMode = it)) },
-        )
-        SettingsDivider()
-        SegmentedRow(
-            label = "VU Clamping",
-            options = listOf("None", "Normal", "Extra", "Extra+Sign"),
-            selectedIndex = s.vuClampMode.coerceIn(0, 3),
-            description = "VU float clamping (both VU0 + VU1). Restart the game to apply.",
-            onChange = { apply(s.copy(vuClampMode = it)) },
-        )
-        SettingsDivider()
-        SegmentedRow(
-            label = "EE FPU Round Mode",
-            options = listOf("Nearest", "Negative", "Positive", "Chop"),
-            selectedIndex = s.eeFpuRoundMode.coerceIn(0, 3),
-            description = "EE FPU float rounding. Chop (toward zero) is the PS2 default — change only if a game needs it. Restart the game to apply.",
-            onChange = { apply(s.copy(eeFpuRoundMode = it)) },
-        )
-        SettingsDivider()
-        SegmentedRow(
-            label = "VU0 Round Mode",
-            options = listOf("Nearest", "Negative", "Positive", "Chop"),
-            selectedIndex = s.vu0RoundMode.coerceIn(0, 3),
-            description = "VU0 float rounding. Chop is the PS2 default. Restart the game to apply.",
-            onChange = { apply(s.copy(vu0RoundMode = it)) },
-        )
-        SettingsDivider()
-        SegmentedRow(
-            label = "VU1 Round Mode",
-            options = listOf("Nearest", "Negative", "Positive", "Chop"),
-            selectedIndex = s.vu1RoundMode.coerceIn(0, 3),
-            description = "VU1 float rounding. Chop is the PS2 default. Restart the game to apply.",
-            onChange = { apply(s.copy(vu1RoundMode = it)) },
-        )
-        SettingsDivider()
-        // Speed Limit / Custom FPS — caps emulation speed as a % of native
-        // (100% ≈ 60fps NTSC / 50fps PAL). Only effective with the Frame
-        // Limiter on. Driven by a preset index; stores the actual percent.
-        run {
-            val speedPresets = listOf(25, 50, 75, 100, 150, 200, 300)
-            val idx = speedPresets.indexOf(s.nominalSpeedPercent).let { if (it < 0) 3 else it }
+        CollapsibleSection("Speedhacks", initiallyExpanded = false) {
             IntSliderRow(
-                label = "FPS / Speed Limit",
-                value = idx,
+                label = "EE Cycle Rate",
+                value = s.eeCycleRate,
+                min = -3,
+                max = 3,
+                description = "CPU overclock/underclock. Higher can help CPU-bound games but may break timing.",
+                valueFormatter = { rate ->
+                    when (rate) {
+                        -3 -> "50%"
+                        -2 -> "60%"
+                        -1 -> "75%"
+                        0 -> "100%"
+                        1 -> "130%"
+                        2 -> "180%"
+                        3 -> "300%"
+                        else -> "$rate"
+                    }
+                },
+                onChange = { apply(s.copy(eeCycleRate = it)) },
+            )
+            SettingsDivider()
+            IntSliderRow(
+                label = "EE Cycle Skip",
+                value = s.eeCycleSkip,
                 min = 0,
-                max = speedPresets.size - 1,
-                description = "Caps emulation speed as a percent of the game's native rate.",
-                valueFormatter = { "${speedPresets[it]}%" },
-                onChange = { apply(s.copy(nominalSpeedPercent = speedPresets[it])) },
+                max = 3,
+                description = "Skips EE cycles for speed. Can cause stutter, physics bugs, or crashes.",
+                onChange = { apply(s.copy(eeCycleSkip = it)) },
+            )
+            SettingsDivider()
+            // Recompiler float-clamping accuracy (PCSX2 parity). Higher = more
+            // accurate float handling (fixes SPS / missing geometry / VU glitches)
+            // at a speed cost. Needs a recompiler reset, so restart the game.
+            SegmentedRow(
+                label = "EE/FPU Clamping",
+                options = listOf("None", "Normal", "Extra", "Full"),
+                selectedIndex = s.eeClampMode.coerceIn(0, 3),
+                description = "FPU overflow/rounding accuracy. Restart the game to apply.",
+                onChange = { apply(s.copy(eeClampMode = it)) },
+            )
+            SettingsDivider()
+            SegmentedRow(
+                label = "VU Clamping",
+                options = listOf("None", "Normal", "Extra", "Extra+Sign"),
+                selectedIndex = s.vuClampMode.coerceIn(0, 3),
+                description = "VU float clamping (both VU0 + VU1). Restart the game to apply.",
+                onChange = { apply(s.copy(vuClampMode = it)) },
+            )
+            SettingsDivider()
+            SegmentedRow(
+                label = "EE FPU Round Mode",
+                options = listOf("Nearest", "Negative", "Positive", "Chop"),
+                selectedIndex = s.eeFpuRoundMode.coerceIn(0, 3),
+                description = "EE FPU float rounding. Chop (toward zero) is the PS2 default — change only if a game needs it. Restart the game to apply.",
+                onChange = { apply(s.copy(eeFpuRoundMode = it)) },
+            )
+            SettingsDivider()
+            SegmentedRow(
+                label = "VU0 Round Mode",
+                options = listOf("Nearest", "Negative", "Positive", "Chop"),
+                selectedIndex = s.vu0RoundMode.coerceIn(0, 3),
+                description = "VU0 float rounding. Chop is the PS2 default. Restart the game to apply.",
+                onChange = { apply(s.copy(vu0RoundMode = it)) },
+            )
+            SettingsDivider()
+            SegmentedRow(
+                label = "VU1 Round Mode",
+                options = listOf("Nearest", "Negative", "Positive", "Chop"),
+                selectedIndex = s.vu1RoundMode.coerceIn(0, 3),
+                description = "VU1 float rounding. Chop is the PS2 default. Restart the game to apply.",
+                onChange = { apply(s.copy(vu1RoundMode = it)) },
+            )
+            SettingsDivider()
+            // Speed Limit % — caps emulation speed as a % of native (100 = full speed).
+            // Arbitrary value; default stays 100. Affects audio pitch / timing / RA.
+            IntSliderRow(
+                label = "Speed Limit %",
+                value = s.nominalSpeedPercent.coerceIn(10, 1000),
+                min = 10,
+                max = 1000,
+                description = "Emulation speed as % of native (100 = full speed). Affects audio pitch, game timing and RetroAchievements (hardcore stays at/above 100%). This is NOT a display cap — pair it with Display FPS Cap for per-game tuning. Best left at 100 unless a game needs it.",
+                valueFormatter = { "$it%" },
+                onChange = { apply(s.copy(nominalSpeedPercent = it)) },
+            )
+            SettingsDivider()
+            // Display FPS Cap — caps the PRESENTED frame rate independently of Speed %.
+            // The GS thread paces presents (accumulator) to hold ANY target rate while
+            // emulation runs full speed (no slowdown). Arbitrary value; 0 = off.
+            IntSliderRow(
+                label = "Display FPS Cap",
+                value = s.fpsLimit.coerceIn(0, 60),
+                min = 0,
+                max = 60,
+                description = "Caps the PRESENTED (display) frame rate — emulation keeps full speed, so this is a display cap, not true emulation FPS. Any value works (use with Speed Limit % to fine-tune per game). 0 = off; values between the clean rates (60/30/20/15) pace a little unevenly.",
+                valueFormatter = { if (it == 0) "Off" else "$it fps" },
+                onChange = { apply(s.copy(fpsLimit = it)) },
+            )
+            SettingsDivider()
+            // Per-region emulated vsync rate (PCSX2 EmuCore/GS FramerateNTSC / FrameratePAL)
+            // — the PS2 refresh the game targets. Defaults 60/50 Hz (true 59.94/50.00).
+            // Speed Limit % is relative to this; this is the rate, not a display cap.
+            IntSliderRow(
+                label = "NTSC Framerate (Hz)",
+                value = Math.round(s.framerateNtsc).coerceIn(20, 75),
+                min = 20,
+                max = 75,
+                description = "Emulated refresh for NTSC (US/JP) games. Default 60 (59.94 Hz). Like NetherSX2's per-region rate; games internally at 30fps run at half this.",
+                valueFormatter = { "$it Hz" },
+                onChange = { apply(s.copy(framerateNtsc = it.toFloat())) },
+            )
+            SettingsDivider()
+            IntSliderRow(
+                label = "PAL Framerate (Hz)",
+                value = Math.round(s.frameratePal).coerceIn(20, 75),
+                min = 20,
+                max = 75,
+                description = "Emulated refresh for PAL (EU) games. Default 50 Hz. Games internally at 25fps run at half this.",
+                valueFormatter = { "$it Hz" },
+                onChange = { apply(s.copy(frameratePal = it.toFloat())) },
+            )
+            SettingsDivider()
+            IntSliderRow(
+                label = "Frame Skip",
+                value = s.frameSkip,
+                min = 0,
+                max = 5,
+                description = "Low-end devices: draw 1 of every (N+1) frames to free up GPU. Emulation still runs full speed; higher = choppier but faster.",
+                valueFormatter = { if (it == 0) "Off" else "Skip $it" },
+                onChange = { apply(s.copy(frameSkip = it)) },
             )
         }
         SettingsDivider()
-        IntSliderRow(
-            label = "Frame Skip",
-            value = s.frameSkip,
-            min = 0,
-            max = 5,
-            description = "Low-end devices: draw 1 of every (N+1) frames to free up GPU. Emulation still runs full speed; higher = choppier but faster.",
-            valueFormatter = { if (it == 0) "Off" else "Skip $it" },
-            onChange = { apply(s.copy(frameSkip = it)) },
-        )
-        SettingsDivider()
-        HelpText("Compatibility shortcuts. Leave Game Fixes off unless a game needs one of the fixes below.")
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            BubbleGridRow {
-                ToggleBubble("Skip BIOS", s.enableFastBoot, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableFastBoot = it))
+        CollapsibleSection("GameDB Fixes") {
+            HelpText("Compatibility shortcuts. Leave GameDB Fixes off unless a game needs one of the fixes below.")
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                BubbleGridRow {
+                    ToggleBubble("Skip BIOS", s.enableFastBoot, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableFastBoot = it))
+                    }
+                    ToggleBubble("GameDB Fixes", s.enableGameFixes, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = it))
+                    }
+                    ToggleBubble("Skip MPEG", s.gamefixSkipMpeg, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixSkipMpeg = it))
+                    }
+                    ToggleBubble("FMV Software", s.gamefixSoftwareRendererFmv, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixSoftwareRendererFmv = it))
+                    }
                 }
-                ToggleBubble("Game Fixes", s.enableGameFixes, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = it))
+                BubbleGridRow {
+                    ToggleBubble("EE Timing", s.gamefixEETiming, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixEETiming = it))
+                    }
+                    ToggleBubble("Instant DMA", s.gamefixInstantDma, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixInstantDma = it))
+                    }
+                    ToggleBubble("Blit FPS", s.gamefixBlitInternalFps, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixBlitInternalFps = it))
+                    }
+                    ToggleBubble("FPU Multiply", s.gamefixFpuMul, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixFpuMul = it))
+                    }
                 }
-                ToggleBubble("Skip MPEG", s.gamefixSkipMpeg, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixSkipMpeg = it))
+                BubbleGridRow {
+                    ToggleBubble("OPH Flag", s.gamefixOphFlag, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixOphFlag = it))
+                    }
+                    ToggleBubble("GIF FIFO", s.gamefixGifFifo, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixGifFifo = it))
+                    }
+                    ToggleBubble("DMA Busy", s.gamefixDmaBusy, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixDmaBusy = it))
+                    }
+                    ToggleBubble("VIF1 Stall", s.gamefixVif1Stall, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixVif1Stall = it))
+                    }
                 }
-                ToggleBubble("FMV Software", s.gamefixSoftwareRendererFmv, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixSoftwareRendererFmv = it))
+                BubbleGridRow {
+                    ToggleBubble("I-Bit", s.gamefixIbit, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixIbit = it))
+                    }
+                    ToggleBubble("Full VU0 Sync", s.gamefixFullVu0Sync, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixFullVu0Sync = it))
+                    }
+                    ToggleBubble("VU Add-Sub", s.gamefixVuAddSub, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixVuAddSub = it))
+                    }
+                    ToggleBubble("VU Overflow", s.gamefixVuOverflow, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixVuOverflow = it))
+                    }
+                }
+                BubbleGridRow {
+                    ToggleBubble("Extra XGKICK", s.gamefixXgkick, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixXgkick = it))
+                    }
+                    ToggleBubble("Goemon TLB", s.gamefixGoemonTlb, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixGoemonTlb = it))
+                    }
+                    ToggleBubble("VU Sync", s.gamefixVuSync, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(enableGameFixes = true, gamefixVuSync = it))
+                    }
+                    Spacer(Modifier.weight(1f))
                 }
             }
-            BubbleGridRow {
-                ToggleBubble("EE Timing", s.gamefixEETiming, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixEETiming = it))
-                }
-                ToggleBubble("Instant DMA", s.gamefixInstantDma, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixInstantDma = it))
-                }
-                ToggleBubble("Blit FPS", s.gamefixBlitInternalFps, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixBlitInternalFps = it))
-                }
-                ToggleBubble("FPU Multiply", s.gamefixFpuMul, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixFpuMul = it))
-                }
-            }
-            BubbleGridRow {
-                ToggleBubble("OPH Flag", s.gamefixOphFlag, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixOphFlag = it))
-                }
-                ToggleBubble("GIF FIFO", s.gamefixGifFifo, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixGifFifo = it))
-                }
-                ToggleBubble("DMA Busy", s.gamefixDmaBusy, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixDmaBusy = it))
-                }
-                ToggleBubble("VIF1 Stall", s.gamefixVif1Stall, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixVif1Stall = it))
-                }
-            }
-            BubbleGridRow {
-                ToggleBubble("I-Bit", s.gamefixIbit, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixIbit = it))
-                }
-                ToggleBubble("Full VU0 Sync", s.gamefixFullVu0Sync, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixFullVu0Sync = it))
-                }
-                ToggleBubble("VU Add-Sub", s.gamefixVuAddSub, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixVuAddSub = it))
-                }
-                ToggleBubble("VU Overflow", s.gamefixVuOverflow, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixVuOverflow = it))
-                }
-            }
-            BubbleGridRow {
-                ToggleBubble("Extra XGKICK", s.gamefixXgkick, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixXgkick = it))
-                }
-                ToggleBubble("Goemon TLB", s.gamefixGoemonTlb, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixGoemonTlb = it))
-                }
-                ToggleBubble("VU Sync", s.gamefixVuSync, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(enableGameFixes = true, gamefixVuSync = it))
-                }
-                Spacer(Modifier.weight(1f))
-            }
+            HelpText(
+                "Skip BIOS - bypasses the PS2 startup screen.\n" +
+                    "GameDB Fixes - master switch for manual compatibility fixes.\n" +
+                    "Skip MPEG - skips problematic video playback.\n" +
+                    "FMV Software - switches FMVs to software rendering.\n" +
+                    "EE Timing - adjusts CPU timing for sensitive games.\n" +
+                    "Instant DMA - completes DMA transfers immediately.\n" +
+                    "Blit FPS - uses PCSX2's internal FPS blit workaround."
+            )
         }
-        HelpText(
-            "Skip BIOS - bypasses the PS2 startup screen.\n" +
-                "Game Fixes - master switch for manual compatibility fixes.\n" +
-                "Skip MPEG - skips problematic video playback.\n" +
-                "FMV Software - switches FMVs to software rendering.\n" +
-                "EE Timing - adjusts CPU timing for sensitive games.\n" +
-                "Instant DMA - completes DMA transfers immediately.\n" +
-                "Blit FPS - uses PCSX2's internal FPS blit workaround."
-        )
         SettingsDivider()
-        Spacer(Modifier.height(8.dp))
-        // On/Off toggles as a 4-wide bubble grid, matching the Playing-Now
-        // action grid in InGameOverlay. Two rows of four cells — last cell
-        // is a Spacer so the seven toggles keep uniform widths across both
-        // rows. Labels are abbreviated to fit the ~74dp cell.
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            BubbleGridRow {
-                ToggleBubble("MTVU", s.mtvu, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(mtvu = it))
+        CollapsibleSection("Advanced Speedhacks") {
+            Spacer(Modifier.height(8.dp))
+            // On/Off toggles as a 4-wide bubble grid, matching the Playing-Now
+            // action grid in InGameOverlay. Two rows of four cells — last cell
+            // is a Spacer so the seven toggles keep uniform widths across both
+            // rows. Labels are abbreviated to fit the ~74dp cell.
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                BubbleGridRow {
+                    ToggleBubble("MTVU", s.mtvu, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(mtvu = it))
+                    }
+                    ToggleBubble("Instant VU1", s.vu1Instant, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(vu1Instant = it))
+                    }
+                    ToggleBubble("VU Flag Hack", s.vuFlagHack, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(vuFlagHack = it))
+                    }
+                    ToggleBubble("Fast CDVD", s.fastCDVD, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(fastCDVD = it))
+                    }
                 }
-                ToggleBubble("Instant VU1", s.vu1Instant, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(vu1Instant = it))
+                BubbleGridRow {
+                    ToggleBubble("INTC Stat", s.intcStat, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(intcStat = it))
+                    }
+                    ToggleBubble("Wait Loop", s.waitLoop, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(waitLoop = it))
+                    }
+                    // Frame Limiter lives on the Play tab's quick toggles — no need
+                    // to duplicate it here.
+                    // ARMSX2 perf-knob: A/B disable for the arm64 VU1 JIT
+                    // NEON peephole fusions. Default on; flip off to confirm
+                    // whether a per-game regression traces back to our
+                    // matrix-transform / cross-product fusion peepholes.
+                    // Block recompilation is not invalidated on toggle —
+                    // already-compiled blocks keep their fused path; new
+                    // blocks pick up the new gate. Restart the game for a
+                    // clean A/B (or hit the recompiler tab to flip a CPU off
+                    // then on, which forces a cache rebuild).
+                    ToggleBubble("VU NEON Fusions", s.vuNeonFusions, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(vuNeonFusions = it))
+                    }
                 }
-                ToggleBubble("VU Flag Hack", s.vuFlagHack, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(vuFlagHack = it))
+                // Heavy / aggressive perf levers — off by default, may break
+                // some games. Effective on next block recompile; for a clean
+                // A/B, restart the game (or bounce a CPU recompiler toggle
+                // off→on to force a JIT cache rebuild).
+                //
+                //   Skip VU Stall Sim — drops the vu1_TestPipes_VU1 BL
+                //     entirely. Was 19-32% of total CPU on Futurama / GoW2 /
+                //     Ape Escape 3. Breaks games that depend on accurate
+                //     FMAC / FDIV / EFU / IALU pipeline-stall timing
+                //     (glitched models, missing geometry, audio crackle).
+                //   Defer VU Writes — VF stores held in the NEON cache,
+                //     committed at flush sites. Saves 1 Str per FMAC pair on
+                //     transforms. Known to break SH2 graphics (cross-pair
+                //     coherence) and similar.
+                BubbleGridRow {
+                    ToggleBubble("Skip VU Stall Sim", s.vuSkipStallSim, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(vuSkipStallSim = it))
+                    }
+                    ToggleBubble("Defer VU Writes", s.vuDeferredWrites, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(vuDeferredWrites = it))
+                    }
+                    ToggleBubble("Skip Dupe Frames", s.skipDuplicateFrames, modifier = Modifier.weight(1f)) {
+                        apply(s.copy(skipDuplicateFrames = it))
+                    }
+                    Spacer(Modifier.weight(1f))
                 }
-                ToggleBubble("Fast CDVD", s.fastCDVD, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(fastCDVD = it))
-                }
-            }
-            BubbleGridRow {
-                ToggleBubble("INTC Stat", s.intcStat, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(intcStat = it))
-                }
-                ToggleBubble("Wait Loop", s.waitLoop, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(waitLoop = it))
-                }
-                // Frame Limiter lives on the Play tab's quick toggles — no need
-                // to duplicate it here.
-                // ARMSX2 perf-knob: A/B disable for the arm64 VU1 JIT
-                // NEON peephole fusions. Default on; flip off to confirm
-                // whether a per-game regression traces back to our
-                // matrix-transform / cross-product fusion peepholes.
-                // Block recompilation is not invalidated on toggle —
-                // already-compiled blocks keep their fused path; new
-                // blocks pick up the new gate. Restart the game for a
-                // clean A/B (or hit the recompiler tab to flip a CPU off
-                // then on, which forces a cache rebuild).
-                ToggleBubble("VU NEON Fusions", s.vuNeonFusions, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(vuNeonFusions = it))
-                }
-            }
-            // Heavy / aggressive perf levers — off by default, may break
-            // some games. Effective on next block recompile; for a clean
-            // A/B, restart the game (or bounce a CPU recompiler toggle
-            // off→on to force a JIT cache rebuild).
-            //
-            //   Skip VU Stall Sim — drops the vu1_TestPipes_VU1 BL
-            //     entirely. Was 19-32% of total CPU on Futurama / GoW2 /
-            //     Ape Escape 3. Breaks games that depend on accurate
-            //     FMAC / FDIV / EFU / IALU pipeline-stall timing
-            //     (glitched models, missing geometry, audio crackle).
-            //   Defer VU Writes — VF stores held in the NEON cache,
-            //     committed at flush sites. Saves 1 Str per FMAC pair on
-            //     transforms. Known to break SH2 graphics (cross-pair
-            //     coherence) and similar.
-            BubbleGridRow {
-                ToggleBubble("Skip VU Stall Sim", s.vuSkipStallSim, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(vuSkipStallSim = it))
-                }
-                ToggleBubble("Defer VU Writes", s.vuDeferredWrites, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(vuDeferredWrites = it))
-                }
-                ToggleBubble("Skip Dupe Frames", s.skipDuplicateFrames, modifier = Modifier.weight(1f)) {
-                    apply(s.copy(skipDuplicateFrames = it))
-                }
-                Spacer(Modifier.weight(1f))
             }
         }
     }

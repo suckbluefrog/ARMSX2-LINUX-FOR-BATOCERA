@@ -14,6 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,6 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.armsx2.Main
 import com.armsx2.config.Settings
 import com.armsx2.input.ControllerMappings
 import com.armsx2.ui.Colors
@@ -91,7 +93,7 @@ fun HotkeysTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
                 }
                 Text(
                     when {
-                        capturing -> "Press 1 button, or 2 together…"
+                        capturing -> "Press a button, push a stick, or 2 together…"
                         unset -> "Not set"
                         else -> binding
                     },
@@ -102,6 +104,20 @@ fun HotkeysTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
             }
             SettingsDivider()
         }
+        // Closing a game opened from a frontend (ES-DE etc.) returns to that
+        // frontend instead of the ARMSX2 library.
+        val exitToLauncher = remember {
+            mutableStateOf(Main.prefs.getBoolean("ui.exitToLauncherExternal", true))
+        }
+        ToggleRow(
+            "Exit to launcher on close (external games)",
+            exitToLauncher.value,
+            description = "When a game was launched from another app (e.g. ES-DE), Close Game returns to that app instead of the ARMSX2 library.",
+        ) { v ->
+            exitToLauncher.value = v
+            Main.prefs.edit().putBoolean("ui.exitToLauncherExternal", v).apply()
+        }
+        SettingsDivider()
         @Suppress("UNUSED_EXPRESSION") Box(Modifier.height(6.dp))
     }
 }

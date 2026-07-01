@@ -360,10 +360,15 @@ public class MainActivity extends AppCompatActivity {
         // Files that MUST always reflect the current APK assets, even on an app
         // UPDATE where the on-disk copy already exists (copyFile otherwise skips
         // existing files): shader sources (a C++ entry-point bump needs the new
-        // GLSL or the compiler reports "main() is missing") AND the GameDB
+        // GLSL or the compiler reports "main() is missing"), the GameDB
         // (GameIndex.yaml — shipped per-game fixes like True Crime's must reach
-        // users who already have an old copy, or the fix never applies).
-        final boolean forceFresh = srcFile.contains("shaders") || srcFile.endsWith("GameIndex.yaml");
+        // users who already have an old copy, or the fix never applies), AND our
+        // GameDB override (armsx2_overrides.yaml — the whole point of that file is
+        // shipping per-game fixes like VP2/LEGO Batman; without force-refresh an
+        // existing user keeps the original copy and override edits never land).
+        final boolean forceFresh = srcFile.contains("shaders")
+                || srcFile.endsWith("GameIndex.yaml")
+                || srcFile.endsWith("armsx2_overrides.yaml");
         try {
             is = assetMgr.open(srcFile);
             File destFileObj = new File(destFile);

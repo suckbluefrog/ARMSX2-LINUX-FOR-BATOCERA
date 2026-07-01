@@ -11,17 +11,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        tools:ignore="ScopedStorage" />
-
-    <!-- "All files access" — required on Android 11+ when the user picks a
-         system folder outside the app's scoped sandbox (e.g. /storage/emulated/0/ARMSX2).
-         emucore's POSIX FileSystem (fopen/fread/mkdir) goes straight to the
-         kernel and scoped storage rejects raw POSIX writes to user-owned
-         public dirs even with a SAF persistable URI grant. The grant is
-         issued at runtime via Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION;
-         users who keep system files in the default app-private dir don't
-         need to enable it. -->
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"
         tools:ignore="ScopedStorage" />
 
     <application

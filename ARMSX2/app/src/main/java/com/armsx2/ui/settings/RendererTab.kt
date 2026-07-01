@@ -30,7 +30,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
 import com.armsx2.Main
-import com.armsx2.config.LiveGsApplyQueue
 import com.armsx2.config.Settings
 import com.armsx2.ui.Colors
 import com.armsx2.ui.InGameOverlay
@@ -72,6 +71,9 @@ private val UPSCALE_OPTIONS = listOf(
     UpscaleOption(3.5f, "3.5x"),
     UpscaleOption(4.0f, "4x"),
     UpscaleOption(5.0f, "5x"),
+    UpscaleOption(6.0f, "6x"),
+    UpscaleOption(7.0f, "7x"),
+    UpscaleOption(8.0f, "8x"),
 )
 
 @Composable
@@ -87,240 +89,298 @@ fun RendererTab(state: MutableState<Settings>) {
             .fillMaxWidth()
             .verticalScroll(scroll),
     ) {
-        // Graphics API (OpenGL / Vulkan) + Vulkan custom-driver picker. Ported
-        // from the removed first-run setup renderer page into settings.
-        RendererBackendSection()
-        SettingsDivider()
-        val upscaleIndex = UPSCALE_OPTIONS
-            .indexOfFirst { abs(it.value - Main.upscale.value) < 0.01f }
-            .takeIf { it >= 0 } ?: 0
-        SegmentedGridRow(
-            label = "Upscale",
-            options = UPSCALE_OPTIONS.map { it.label },
-            selectedIndex = upscaleIndex,
-            columns = 4,
-            description = "Internal resolution. Higher values are sharper but can expose game-specific bloom or alignment artifacts.",
-            onChange = { index ->
-                val mult = UPSCALE_OPTIONS[index].value
-                if (abs(Main.upscale.value - mult) >= 0.01f) {
-                    Main.upscale.value = mult
-                    Main.prefs.edit().putFloat("upscaleFloat", mult).apply()
-                    LiveGsApplyQueue.applyUpscale(mult)
-                }
-            },
-        )
-        SettingsDivider()
-        SegmentedRow(
-            label = "Display Mode",
-            options = listOf("Stretch", "Auto", "4:3", "16:9", "10:7"),
-            selectedIndex = s.aspectRatio.coerceIn(0, 4),
-            description = "Controls how the PS2 image fits the screen.",
-            onChange = { apply(s.copy(aspectRatio = it)) },
-        )
-        SettingsDivider()
-        SegmentedGridRow(
-            label = "Deinterlacing",
-            options = listOf(
-                "Auto", "Off", "Weave TFF", "Weave BFF", "Bob TFF",
-                "Bob BFF", "Blend TFF", "Blend BFF", "Adapt TFF", "Adapt BFF",
-            ),
-            selectedIndex = s.deinterlaceMode.coerceIn(0, 9),
-            columns = 5,
-            description = "Changes how interlaced video is displayed. Auto is safest.",
-            onChange = { apply(s.copy(deinterlaceMode = it)) },
-        )
-        SettingsDivider()
-        SegmentedRow(
-            label = "Texture Filtering",
-            options = listOf("Nearest", "Forced", "PS2", "Sprite"),
-            selectedIndex = s.textureFiltering.coerceIn(0, 3),
-            description = "Controls texture smoothing. PS2 is safest; Forced can soften or brighten some games.",
-            onChange = { apply(s.copy(textureFiltering = it)) },
-        )
-        SettingsDivider()
-        SegmentedRow(
-            label = "Texture Preloading",
-            options = listOf("Off", "Partial", "Full"),
-            selectedIndex = s.texturePreloading.coerceIn(0, 2),
-            description = "Preloads textures to avoid missing or late texture uploads. Full is the safe default.",
-            onChange = { apply(s.copy(texturePreloading = it)) },
-        )
-        SettingsDivider()
-        SegmentedGridRow(
-            label = "Hardware Download Mode",
-            options = listOf("Accurate", "Force Full", "No Readbacks", "Unsync", "Disabled"),
-            selectedIndex = s.hardwareDownloadMode.coerceIn(0, 4),
-            columns = 3,
-            description = "Readback accuracy for effects that need GPU data. Faster modes may break effects.",
-            onChange = { apply(s.copy(hardwareDownloadMode = it)) },
-        )
-        SettingsDivider()
-        SegmentedGridRow(
-            label = "CRT / TV Shader",
-            options = listOf("Off", "Scanline", "Diagonal", "Tri", "Wave", "Lottes", "4xRGSS", "NxAGSS"),
-            selectedIndex = s.tvShader.coerceIn(0, 7),
-            columns = 4,
-            description = "Post-process CRT/TV filters. Applies live on supported renderers.",
-            onChange = { apply(s.copy(tvShader = it)) },
-        )
-        SettingsDivider()
-        ToggleRow(
-            "VSync",
-            s.vsyncEnable,
-            description = "Sync presentation to the display refresh — less tearing/smoother, slightly more latency. Restart the game to apply.",
-        ) {
-            apply(s.copy(vsyncEnable = it))
-        }
-        SettingsDivider()
-        ToggleRow(
-            "Shadeboost",
-            s.shadeBoost,
-            description = "Post-process colour controls for brightness, contrast, saturation, and gamma.",
-        ) {
-            apply(s.copy(shadeBoost = it))
-        }
-        if (s.shadeBoost) {
+        CollapsibleSection("Display & Resolution", initiallyExpanded = false) {
+            // Graphics API (OpenGL / Vulkan) + Vulkan custom-driver picker. Ported
+            // from the removed first-run setup renderer page into settings.
+            RendererBackendSection(state)
             SettingsDivider()
-            IntSliderRow(
-                label = "Brightness",
-                value = s.shadeBoostBrightness.coerceIn(1, 100),
-                min = 1,
-                max = 100,
-                description = "50 is normal.",
-                valueFormatter = { "$it%" },
-                onChange = { apply(s.copy(shadeBoostBrightness = it)) },
+            val upscaleIndex = UPSCALE_OPTIONS
+                .indexOfFirst { abs(it.value - s.upscaleFloat) < 0.01f }
+                .takeIf { it >= 0 } ?: 0
+            SegmentedGridRow(
+                label = "Upscale",
+                options = UPSCALE_OPTIONS.map { it.label },
+                selectedIndex = upscaleIndex,
+                columns = 4,
+                description = "Internal resolution. Higher values are sharper but can expose game-specific bloom or alignment artifacts.",
+                onChange = { index ->
+                    val mult = UPSCALE_OPTIONS[index].value
+                    // Persist scope-aware (per-game when the overlay scope is Game);
+                    // the live GS apply happens in InGameOverlay's settings delta.
+                    if (abs(s.upscaleFloat - mult) >= 0.01f) apply(s.copy(upscaleFloat = mult))
+                },
             )
             SettingsDivider()
-            IntSliderRow(
-                label = "Contrast",
-                value = s.shadeBoostContrast.coerceIn(1, 100),
-                min = 1,
-                max = 100,
-                description = "50 is normal.",
-                valueFormatter = { "$it%" },
-                onChange = { apply(s.copy(shadeBoostContrast = it)) },
+            SegmentedRow(
+                label = "Display Mode",
+                options = listOf("Stretch", "Auto", "4:3", "16:9", "10:7"),
+                selectedIndex = s.aspectRatio.coerceIn(0, 4),
+                description = "Controls how the PS2 image fits the screen.",
+                onChange = { apply(s.copy(aspectRatio = it)) },
             )
             SettingsDivider()
-            IntSliderRow(
-                label = "Saturation",
-                value = s.shadeBoostSaturation.coerceIn(1, 100),
-                min = 1,
-                max = 100,
-                description = "50 is normal.",
-                valueFormatter = { "$it%" },
-                onChange = { apply(s.copy(shadeBoostSaturation = it)) },
+            // Emulation Screen Orientation — global (Android activity orientation), stored
+            // in prefs and applied via Main; not an emucore/per-game setting.
+            val orientation = remember { mutableStateOf(com.armsx2.Main.prefs.getInt("ui.orientation", 0)) }
+            SegmentedRow(
+                label = "Emulation Screen Orientation",
+                options = listOf("Device", "Landscape", "Portrait", "Auto-Rotate"),
+                selectedIndex = orientation.value.coerceIn(0, 3),
+                description = "Locks the app's screen orientation. \"Device\" follows your system auto-rotate setting.",
+                onChange = {
+                    orientation.value = it
+                    com.armsx2.Main.prefs.edit().putInt("ui.orientation", it).apply()
+                    com.armsx2.Main.instance?.applyEmulationOrientation()
+                },
             )
             SettingsDivider()
-            IntSliderRow(
-                label = "Gamma",
-                value = s.shadeBoostGamma.coerceIn(1, 100),
-                min = 1,
-                max = 100,
-                description = "50 is normal.",
-                valueFormatter = { "$it%" },
-                onChange = { apply(s.copy(shadeBoostGamma = it)) },
+            SegmentedGridRow(
+                label = "Deinterlacing",
+                options = listOf(
+                    "Auto", "Off", "Weave TFF", "Weave BFF", "Bob TFF",
+                    "Bob BFF", "Blend TFF", "Blend BFF", "Adapt TFF", "Adapt BFF",
+                ),
+                selectedIndex = s.deinterlaceMode.coerceIn(0, 9),
+                columns = 5,
+                description = "Changes how interlaced video is displayed. Auto is safest.",
+                onChange = { apply(s.copy(deinterlaceMode = it)) },
             )
         }
         SettingsDivider()
-        ToggleRow(
-            "Load Texture Packs",
-            s.loadTextureReplacements,
-            description = "Loads replacement textures from the active game's texture folder.",
-        ) {
-            apply(s.copy(loadTextureReplacements = it))
+        CollapsibleSection("Textures & Filtering") {
+            SegmentedRow(
+                label = "Texture Filtering",
+                options = listOf("Nearest", "Forced", "PS2", "Sprite"),
+                selectedIndex = s.textureFiltering.coerceIn(0, 3),
+                description = "Controls texture smoothing. PS2 is safest; Forced can soften or brighten some games.",
+                onChange = { apply(s.copy(textureFiltering = it)) },
+            )
+            SettingsDivider()
+            SegmentedRow(
+                label = "Texture Preloading",
+                options = listOf("Off", "Partial", "Full"),
+                selectedIndex = s.texturePreloading.coerceIn(0, 2),
+                description = "Preloads textures to avoid missing or late texture uploads. Full is the safe default.",
+                onChange = { apply(s.copy(texturePreloading = it)) },
+            )
+            SettingsDivider()
+            SegmentedGridRow(
+                label = "Hardware Download Mode",
+                options = listOf("Accurate", "Force Full", "No Readbacks", "Unsync", "Disabled"),
+                selectedIndex = s.hardwareDownloadMode.coerceIn(0, 4),
+                columns = 3,
+                description = "Readback accuracy for effects that need GPU data. Faster modes may break effects.",
+                onChange = { apply(s.copy(hardwareDownloadMode = it)) },
+            )
         }
         SettingsDivider()
-        ToggleRow(
-            "Async Texture Loading",
-            s.loadTextureReplacementsAsync,
-            description = "Loads replacements in the background to reduce stalls.",
-        ) {
-            apply(s.copy(loadTextureReplacementsAsync = it))
+        CollapsibleSection("Display Effects") {
+            SegmentedGridRow(
+                label = "CRT / TV Shader",
+                options = listOf("Off", "Scanline", "Diagonal", "Tri", "Wave", "Lottes", "4xRGSS", "NxAGSS"),
+                selectedIndex = s.tvShader.coerceIn(0, 7),
+                columns = 4,
+                description = "Post-process CRT/TV filters. Applies live on supported renderers.",
+                onChange = { apply(s.copy(tvShader = it)) },
+            )
+            SettingsDivider()
+            ToggleRow(
+                "VSync",
+                s.vsyncEnable,
+                description = "Sync presentation to the display refresh — less tearing/smoother, slightly more latency. Restart the game to apply.",
+            ) {
+                apply(s.copy(vsyncEnable = it))
+            }
+            SettingsDivider()
+            ToggleRow(
+                "Shadeboost",
+                s.shadeBoost,
+                description = "Post-process colour controls for brightness, contrast, saturation, and gamma.",
+            ) {
+                apply(s.copy(shadeBoost = it))
+            }
+            if (s.shadeBoost) {
+                SettingsDivider()
+                IntSliderRow(
+                    label = "Brightness",
+                    value = s.shadeBoostBrightness.coerceIn(1, 100),
+                    min = 1,
+                    max = 100,
+                    description = "50 is normal.",
+                    valueFormatter = { "$it%" },
+                    onChange = { apply(s.copy(shadeBoostBrightness = it)) },
+                )
+                SettingsDivider()
+                IntSliderRow(
+                    label = "Contrast",
+                    value = s.shadeBoostContrast.coerceIn(1, 100),
+                    min = 1,
+                    max = 100,
+                    description = "50 is normal.",
+                    valueFormatter = { "$it%" },
+                    onChange = { apply(s.copy(shadeBoostContrast = it)) },
+                )
+                SettingsDivider()
+                IntSliderRow(
+                    label = "Saturation",
+                    value = s.shadeBoostSaturation.coerceIn(1, 100),
+                    min = 1,
+                    max = 100,
+                    description = "50 is normal.",
+                    valueFormatter = { "$it%" },
+                    onChange = { apply(s.copy(shadeBoostSaturation = it)) },
+                )
+                SettingsDivider()
+                IntSliderRow(
+                    label = "Gamma",
+                    value = s.shadeBoostGamma.coerceIn(1, 100),
+                    min = 1,
+                    max = 100,
+                    description = "50 is normal.",
+                    valueFormatter = { "$it%" },
+                    onChange = { apply(s.copy(shadeBoostGamma = it)) },
+                )
+            }
         }
         SettingsDivider()
-        ToggleRow(
-            "Precache Texture Packs",
-            s.precacheTextureReplacements,
-            description = "Scans replacements at boot. Slower startup, fewer in-game hitches.",
-        ) {
-            apply(s.copy(precacheTextureReplacements = it))
+        CollapsibleSection("Texture Packs") {
+            ToggleRow(
+                "Load Texture Packs",
+                s.loadTextureReplacements,
+                description = "Loads replacement textures from the active game's texture folder.",
+            ) {
+                apply(s.copy(loadTextureReplacements = it))
+            }
+            SettingsDivider()
+            ToggleRow(
+                "Async Texture Loading",
+                s.loadTextureReplacementsAsync,
+                description = "Loads replacements in the background to reduce stalls.",
+            ) {
+                apply(s.copy(loadTextureReplacementsAsync = it))
+            }
+            SettingsDivider()
+            ToggleRow(
+                "Precache Texture Packs",
+                s.precacheTextureReplacements,
+                description = "Scans replacements at boot. Slower startup, fewer in-game hitches.",
+            ) {
+                apply(s.copy(precacheTextureReplacements = it))
+            }
+            SettingsDivider()
+            TexturePackImportRow()
+            SettingsDivider()
+            ToggleRow(
+                "Dump Replaceable Textures",
+                s.dumpReplaceableTextures,
+                description = "Writes textures used by the game to disk for pack creation.",
+            ) {
+                apply(s.copy(dumpReplaceableTextures = it))
+            }
+            SettingsDivider()
+            ToggleRow(
+                "Texture Pack OSD",
+                s.osdShowTextureReplacements,
+                description = "Shows texture replacement status messages in-game.",
+            ) {
+                apply(s.copy(osdShowTextureReplacements = it))
+            }
         }
         SettingsDivider()
-        TexturePackImportRow()
-        SettingsDivider()
-        ToggleRow(
-            "Dump Replaceable Textures",
-            s.dumpReplaceableTextures,
-            description = "Writes textures used by the game to disk for pack creation.",
-        ) {
-            apply(s.copy(dumpReplaceableTextures = it))
+        CollapsibleSection("Blending & Advanced") {
+            SegmentedRow(
+                label = "Blending Accuracy",
+                options = listOf("Min", "Basic", "Med", "High", "Full", "Max"),
+                selectedIndex = s.accurateBlendingUnit.coerceIn(0, 5),
+                description = "Controls alpha/blending precision. Basic is faster; higher can fix effects.",
+                onChange = { apply(s.copy(accurateBlendingUnit = it)) },
+            )
+            // Blending-accuracy companion features (match upstream's grouping under
+            // Blending Accuracy). ROV + Accurate Alpha Test apply live; AA1 needs a
+            // game restart.
+            SettingsDivider()
+            ToggleRow(
+                "Rasterizer Ordered View (ROV)",
+                s.hwRov,
+                description = "Vulkan only: accurate blending via fragment-shader interlock. Mainly benefits desktop GPUs — most mobile GPUs either lack the required interlock (e.g. Turnip) or run it slower than the default blending path. Leave off unless your own benchmarks show a gain. No effect on OpenGL. Applies live.",
+            ) {
+                apply(s.copy(hwRov = it))
+            }
+            SettingsDivider()
+            ToggleRow(
+                "Accurate blending fast path (experimental)",
+                s.adrenoFbFetch,
+                description = "Vulkan + Adreno only: route accurate blending through the tile-memory framebuffer-fetch path instead of ROV / texture-barrier copies — the mobile-native equivalent of desktop ROV, and usually much faster on a tiler. Experimental: some drivers return stale reads and may show artifacts (sprite alpha cutouts, invisible floor patches), so verify your games. Restart the game to apply. No effect on Mali (already enabled) or OpenGL.",
+            ) {
+                apply(s.copy(adrenoFbFetch = it))
+            }
+            SettingsDivider()
+            ToggleRow(
+                "Accurate Alpha Test",
+                s.hwAat,
+                description = "More accurate alpha testing in the hardware renderer (pairs with ROV). Applies live.",
+            ) {
+                apply(s.copy(hwAat = it))
+            }
+            SettingsDivider()
+            ToggleRow(
+                "HW AA1 (edge anti-aliasing)",
+                s.hwAa1,
+                description = "Hardware PS2 AA1 line/triangle edge anti-aliasing. Restart the game to apply.",
+            ) {
+                apply(s.copy(hwAa1 = it))
+            }
+            // Hardware & upscaling compatibility fixes now live in the dedicated
+            // "Fixes" tab (FixesTab) to keep Render focused on quality/display.
+            SettingsDivider()
+            ToggleRow(
+                "HW Mipmapping",
+                s.hwMipmap,
+                description = "Uses mipmaps in hardware renderers. Can fix texture shimmer or broken effects.",
+            ) {
+                apply(s.copy(hwMipmap = it))
+            }
+            SettingsDivider()
+            // TriFilter is signed (-1 = Auto). Map enum range onto 0..3.
+            val triLabels = listOf("Auto", "Off", "PS2", "Forced")
+            val triIdx = (s.triFilter + 1).coerceIn(0, 3)
+            SegmentedRow(
+                label = "Trilinear",
+                options = triLabels,
+                selectedIndex = triIdx,
+                description = "Mip texture filtering. Auto is safest for compatibility.",
+                onChange = { apply(s.copy(triFilter = it - 1)) },
+            )
+            SettingsDivider()
+            val anisoLabels = listOf("Off", "2x", "4x", "8x", "16x")
+            val anisoVals = listOf(0, 2, 4, 8, 16)
+            val anisoIdx = anisoVals.indexOf(s.maxAnisotropy).coerceAtLeast(0)
+            SegmentedRow(
+                label = "Anisotropic",
+                options = anisoLabels,
+                selectedIndex = anisoIdx,
+                description = "Sharpens angled textures. Higher values can cost GPU time.",
+                onChange = { apply(s.copy(maxAnisotropy = anisoVals[it])) },
+            )
+            SettingsDivider()
+            // GPU profile override. Auto resolves at device init via
+            // GpuProfileDetector::Resolve (vendor strings + Android ro.soc.*
+            // hints). Mali uses ARM_shader_framebuffer_fetch over texture
+            // barriers; Adreno uses the EXT fetch / generic path; PowerVR
+            // (Imagination) uses EXT/PLS like Adreno but is its own tile-based
+            // GPU family. Changing requires a renderer restart — CheckFeatures
+            // runs once at device init, so we kick Main.restart() the same way
+            // RestartButton does.
+            SegmentedRow(
+                label = "GPU Profile",
+                options = listOf("Auto", "Mali", "Adreno", "PowerVR"),
+                selectedIndex = s.gpuProfile.coerceIn(0, 3),
+                description = "Overrides Android GPU workaround selection. Auto is recommended.",
+                onChange = {
+                    apply(s.copy(gpuProfile = it))
+                },
+            )
         }
-        SettingsDivider()
-        ToggleRow(
-            "Texture Pack OSD",
-            s.osdShowTextureReplacements,
-            description = "Shows texture replacement status messages in-game.",
-        ) {
-            apply(s.copy(osdShowTextureReplacements = it))
-        }
-        SettingsDivider()
-        SegmentedRow(
-            label = "Blending Accuracy",
-            options = listOf("Min", "Basic", "Med", "High", "Full", "Max"),
-            selectedIndex = s.accurateBlendingUnit.coerceIn(0, 5),
-            description = "Controls alpha/blending precision. Basic is faster; higher can fix effects.",
-            onChange = { apply(s.copy(accurateBlendingUnit = it)) },
-        )
-        // Hardware & upscaling compatibility fixes now live in the dedicated
-        // "Fixes" tab (FixesTab) to keep Render focused on quality/display.
-        SettingsDivider()
-        ToggleRow(
-            "HW Mipmapping",
-            s.hwMipmap,
-            description = "Uses mipmaps in hardware renderers. Can fix texture shimmer or broken effects.",
-        ) {
-            apply(s.copy(hwMipmap = it))
-        }
-        SettingsDivider()
-        // TriFilter is signed (-1 = Auto). Map enum range onto 0..3.
-        val triLabels = listOf("Auto", "Off", "PS2", "Forced")
-        val triIdx = (s.triFilter + 1).coerceIn(0, 3)
-        SegmentedRow(
-            label = "Trilinear",
-            options = triLabels,
-            selectedIndex = triIdx,
-            description = "Mip texture filtering. Auto is safest for compatibility.",
-            onChange = { apply(s.copy(triFilter = it - 1)) },
-        )
-        SettingsDivider()
-        val anisoLabels = listOf("Off", "2x", "4x", "8x", "16x")
-        val anisoVals = listOf(0, 2, 4, 8, 16)
-        val anisoIdx = anisoVals.indexOf(s.maxAnisotropy).coerceAtLeast(0)
-        SegmentedRow(
-            label = "Anisotropic",
-            options = anisoLabels,
-            selectedIndex = anisoIdx,
-            description = "Sharpens angled textures. Higher values can cost GPU time.",
-            onChange = { apply(s.copy(maxAnisotropy = anisoVals[it])) },
-        )
-        SettingsDivider()
-        // GPU profile override. Auto resolves at device init via
-        // GpuProfileDetector::Resolve (vendor strings + Android ro.soc.*
-        // hints). Mali uses ARM_shader_framebuffer_fetch over texture
-        // barriers; Adreno uses the EXT fetch / generic path; PowerVR
-        // (Imagination) uses EXT/PLS like Adreno but is its own tile-based
-        // GPU family. Changing requires a renderer restart — CheckFeatures
-        // runs once at device init, so we kick Main.restart() the same way
-        // RestartButton does.
-        SegmentedRow(
-            label = "GPU Profile",
-            options = listOf("Auto", "Mali", "Adreno", "PowerVR"),
-            selectedIndex = s.gpuProfile.coerceIn(0, 3),
-            description = "Overrides Android GPU workaround selection. Auto is recommended.",
-            onChange = {
-                apply(s.copy(gpuProfile = it))
-            },
-        )
     }
 }
 

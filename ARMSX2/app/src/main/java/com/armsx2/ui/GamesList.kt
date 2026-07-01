@@ -64,12 +64,18 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -77,18 +83,26 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
+import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import com.armsx2.R
 import com.armsx2.EmuState
 import com.armsx2.FilenameParser
 import com.armsx2.CoverArtStyle
+import com.armsx2.CustomCovers
 import com.armsx2.GameInfo
+import com.armsx2.LibraryTitles
+import com.armsx2.LibraryView
 import com.armsx2.GamePlatform
 import com.armsx2.Main
 import kr.co.iefriends.pcsx2.NativeApp
 import org.json.JSONArray
 import org.json.JSONObject
+import android.os.Build
+import android.os.Environment
+import android.os.ParcelFileDescriptor
+import com.armsx2.BuildConfig
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -107,6 +121,11 @@ private val GAME_EXTENSIONS = setOf(
  *  "one game per folder" / "by-letter" organisation, capped so a pathological
  *  tree (or a SAF mount that loops) can't make the scan run away. */
 private const val MAX_SCAN_DEPTH = 12
+
+// Display font for the under-cover game titles: Bebas Neue (SIL Open Font
+// License). All-caps + condensed, so long titles fit; OFL is fork-safe and
+// redistributable, unlike the earlier commercial font.
+private val TitleFont = FontFamily(Font(R.font.bebas_neue))
 
 object GamesList {
     private const val KEY_LIBRARY_BACKGROUND = "library.background.path"
@@ -128,6 +147,10 @@ object GamesList {
     private val recentLoaded = mutableStateOf(false)
     private val customBackgroundPath = mutableStateOf<String?>(null)
     private val customBackgroundLoaded = mutableStateOf(false)
+    // Preloaded custom-cover index (lowercased stem -> file), refreshed on
+    // CustomCovers.version. Cover tiles look this up synchronously instead of each
+    // doing its own dir listing mid-scroll (which raced and mis-assigned covers).
+    private val customCoverMap = mutableStateOf<Map<String, File>>(emptyMap())
     private val controllerSelectedUri = mutableStateOf<String?>(null)
     private data class ControllerGameRow(
         val rowId: Int,
@@ -152,10 +175,11 @@ object GamesList {
     private enum class Zone { TOOLBAR, GRID, RAIL }
     private val controllerZone = mutableStateOf(Zone.GRID)
     private val controllerToolbarIndex = mutableStateOf(0)
-    // The left rail holds an info button (top) and the gear (bottom). On small
-    // screens the old help text was tall enough to push the gear off-screen, so
-    // it now lives behind this button as its own screen. 0 = info, 1 = gear.
-    private val railSelection = mutableStateOf(1)
+    // The left rail holds an info button (top), an "Aa" titles toggle (middle),
+    // and the gear (bottom). On small screens the old help text was tall enough
+    // to push the gear off-screen, so it now lives behind the info button as its
+    // own screen. 0 = info, 1 = titles toggle, 2 = gear.
+    private val railSelection = mutableStateOf(3)
     private val infoDialogOpen = mutableStateOf(false)
     // Toolbar actions, published from HeaderRow composition so they capture the
     // live ActivityResult launchers / context. Label + click action, in order.
@@ -185,9 +209,9 @@ object GamesList {
                 return true
             }
             Zone.RAIL -> {
-                // Info button (top) + gear (bottom) live on the rail. Up/down
-                // switch between them; right returns to the grid.
-                if (dy != 0) railSelection.value = (railSelection.value + if (dy < 0) -1 else 1).coerceIn(0, 1)
+                // Info (top) + titles toggle + list/shelf toggle + gear (bottom)
+                // live on the rail. Up/down move between them; right returns to grid.
+                if (dy != 0) railSelection.value = (railSelection.value + if (dy < 0) -1 else 1).coerceIn(0, 3)
                 if (dx > 0) controllerZone.value = Zone.GRID
                 return true
             }
@@ -199,7 +223,7 @@ object GamesList {
             // No games yet — up reaches the toolbar, left reaches the gear, so
             // the controller can scan / open setup on a fresh install.
             if (dy < 0) controllerZone.value = Zone.TOOLBAR
-            else if (dx < 0) { railSelection.value = 1; controllerZone.value = Zone.RAIL }
+            else if (dx < 0) { railSelection.value = 3; controllerZone.value = Zone.RAIL }
             return true
         }
 
@@ -215,7 +239,7 @@ object GamesList {
         } else if (dx != 0) {
             if (dx < 0 && current.columnIndex == 0) {
                 // Left off the first cover of any shelf → the gear on the rail.
-                railSelection.value = 1
+                railSelection.value = 3
                 controllerZone.value = Zone.RAIL
                 return true
             }
@@ -232,8 +256,12 @@ object GamesList {
             Zone.TOOLBAR ->
                 controllerToolbarActions.getOrNull(controllerToolbarIndex.value)?.second?.invoke()
             Zone.RAIL ->
-                if (railSelection.value == 0) infoDialogOpen.value = true
-                else InGameOverlay.openGlobalSettings()
+                when (railSelection.value) {
+                    0 -> infoDialogOpen.value = true
+                    1 -> LibraryTitles.set(!LibraryTitles.show.value)
+                    2 -> LibraryView.toggleListMode()
+                    else -> InGameOverlay.openGlobalSettings()
+                }
             Zone.GRID -> {
                 val rows = controllerRows.filter { it.games.isNotEmpty() }
                 if (rows.isNotEmpty()) launchGame(controllerSelectedPosition(rows).game)
@@ -291,6 +319,14 @@ object GamesList {
             }
         }
 
+        // Preload the custom-cover index off the main thread; refresh when a cover
+        // is added/removed (CustomCovers.version bump). Cover tiles read this map
+        // synchronously, so they don't each list the dir mid-scroll (which raced
+        // and mis-assigned covers across games).
+        LaunchedEffect(CustomCovers.version.value) {
+            customCoverMap.value = withContext(Dispatchers.IO) { CustomCovers.loadAll(context) }
+        }
+
         // Stable cache key — order-independent join of all configured dirs.
         // Two-dir configs in either order hit the same cache, single-dir
         // matches the old format. Used for both "is the cache stale?"
@@ -309,10 +345,12 @@ object GamesList {
                 cacheLoaded.value = true
                 val (cachedKey, cachedGames) = loadCache(context)
                 if (cachedKey == romsKey) {
+                    // Show the cached list instantly for a snappy open, then fall
+                    // through to a background rescan so games added to the folder
+                    // since last launch are picked up automatically (issue #223) —
+                    // no manual Refresh tap needed, and no blocking wait.
                     games.clear()
                     games.addAll(cachedGames)
-                    lastScannedRoms.value = romsKey
-                    return@LaunchedEffect
                 }
             }
 
@@ -359,8 +397,20 @@ object GamesList {
      *  caches that were built before .img/.mdf/.nrg/.dump were probed for
      *  serials and before DMC2 Dante/Lucia filename fallback landed — bump
      *  again any time the probe coverage changes. */
+    /** github (all-files) build with All-Files Access actually granted: read ROMs
+     *  via raw /storage paths instead of SAF, because holding the permission evicts
+     *  the persisted SAF tree grant so openFileDescriptor() throws. Play (flavor
+     *  STORAGE_ALL_FILES=false) and github-without-the-grant keep the SAF path. */
+    private fun allFilesRomMode(): Boolean =
+        BuildConfig.STORAGE_ALL_FILES &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            Environment.isExternalStorageManager()
+
+    // The "|raw" suffix keeps the raw-mode cache (file:// URIs) separate from the
+    // SAF cache (content:// URIs), so toggling All-Files Access can't make the
+    // launch path use a URI from the wrong mode.
     private fun cacheKeyForDirs(dirs: List<String>): String =
-        dirs.toSet().sorted().joinToString("|") + "|v3"
+        dirs.toSet().sorted().joinToString("|") + "|v3" + if (allFilesRomMode()) "|raw" else ""
 
     @Composable
     private fun LibraryScreen(context: Context, romsDirs: List<String>, romsKey: String) {
@@ -418,16 +468,45 @@ object GamesList {
         landscape: Boolean,
         modifier: Modifier = Modifier,
     ) {
-        val currentShelfGames = recentUris
+        // Fit-per-row: size each shelf to the covers that actually fit the screen
+        // width, so games wrap onto MORE shelves and the user only scrolls DOWN.
+        // A manual column count (LibraryView.columns) overrides the auto fit and
+        // drives cover size; list view collapses to one game per row (names only).
+        val screenWidthDp = LocalConfiguration.current.screenWidthDp
+        val screenHeightDp = LocalConfiguration.current.screenHeightDp
+        val listMode = LibraryView.listMode.value
+        val userCols = LibraryView.columns.value
+        val userRows = LibraryView.rows.value
+        val coverPlusGapDp = (if (landscape) 92 else 98) + 28
+        val navRailDp = if (landscape) 88 else 0
+        val availDp = (screenWidthDp - navRailDp - 52).coerceAtLeast(coverPlusGapDp)
+        val autoPerRow = ((availDp + 28) / coverPlusGapDp).coerceAtLeast(1)
+        val perRow = when {
+            listMode -> 1
+            userCols > 0 -> userCols
+            else -> autoPerRow
+        }
+        // Manual grid → derive cover width to fit `perRow` across, optionally capped
+        // so `userRows` rows fit the screen height (CoverArt aspect = 0.7 = w/h).
+        val customCoverW: Dp? = if (!listMode && (userCols > 0 || userRows > 0)) {
+            val byCol = (availDp - 28 * (perRow - 1)).toFloat() / perRow
+            val byRow = if (userRows > 0) {
+                val chrome = if (landscape) 150 else 180
+                val availH = (screenHeightDp - chrome).coerceAtLeast(160).toFloat()
+                (availH / userRows) * 0.7f
+            } else Float.MAX_VALUE
+            minOf(byCol, byRow).coerceIn(48f, 220f).dp
+        } else null
+        val currentShelfGames = if (listMode) emptyList() else recentUris
             .mapNotNull { uri -> games.firstOrNull { it.uri.toString() == uri } }
-            .take(5)
-            .ifEmpty { games.take(if (landscape) 8 else 6) }
-        val libraryRows = games.chunked(if (landscape) 8 else 5)
+            .take(perRow)
+            .ifEmpty { games.take(perRow) }
+        val libraryRows = games.chunked(perRow)
         val controllerLayoutRows = buildList {
             if (currentShelfGames.isNotEmpty()) add(currentShelfGames)
             addAll(libraryRows)
         }
-        val firstLibraryRowItem = if (currentShelfGames.isNotEmpty()) 3 else 2
+        val firstLibraryRowItem = if (currentShelfGames.isNotEmpty()) 3 else 1
         val controllerRowsForUi = buildList {
             if (currentShelfGames.isNotEmpty()) add(ControllerGameRow(0, currentShelfGames, 1))
             libraryRows.forEachIndexed { index, row ->
@@ -571,15 +650,22 @@ object GamesList {
                     )
                 }
                 item(key = "__current_shelf__") {
+                        val recentCoverW = customCoverW ?: (if (landscape) 92.dp else 98.dp)
+                        val titlesExtra = if (LibraryTitles.show.value) 44.dp else 0.dp
+                        val recentShelfH = if (customCoverW != null)
+                            ((recentCoverW.value / 0.7f) + 84f).dp + titlesExtra
+                        else (if (landscape) 220.dp else 194.dp) + titlesExtra
                         GameShelf(
                             games = currentShelfGames,
                             label = null,
                             rowId = 0,
                             listItemIndex = 1,
-                            coverWidth = if (landscape) 92.dp else 98.dp,
+                            coverWidth = recentCoverW,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(if (landscape) 220.dp else 194.dp),
+                                // Grow the shelf when titles are on so the 2-line
+                                // label + version tag below the cover isn't clipped.
+                                .height(recentShelfH),
                     )
                 }
             } else {
@@ -594,23 +680,40 @@ object GamesList {
             }
 
             if (games.isNotEmpty()) {
-                item(key = "__library_title__") {
-                    SectionHeader("Library")
+                // Only label the "Library" section when a "Recently Played" shelf sits
+                // above it; otherwise the top HeaderRow already reads "Library" (avoids
+                // the doubled heading in list view / no-recent libraries).
+                if (currentShelfGames.isNotEmpty()) {
+                    item(key = "__library_title__") {
+                        SectionHeader("Library")
+                    }
                 }
                 lazyItemsIndexed(libraryRows, key = { _, row ->
                     row.joinToString("|") { it.uri.toString() }
                 }) { rowIndex, row ->
-                    val label = shelfLabelFor(row)
-                    GameShelf(
-                        games = row,
-                        label = label,
-                        rowId = rowIndex + 1,
-                        listItemIndex = firstLibraryRowItem + rowIndex,
-                        coverWidth = if (landscape) 86.dp else 98.dp,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(if (landscape) 204.dp else 230.dp),
-                    )
+                    if (listMode) {
+                        // List view: one full-width name row per game (perRow == 1).
+                        ListGameRow(game = row.first(), rowId = rowIndex + 1)
+                    } else {
+                        val label = shelfLabelFor(row)
+                        val libCoverW = customCoverW ?: (if (landscape) 86.dp else 98.dp)
+                        val titlesExtra = if (LibraryTitles.show.value) 44.dp else 0.dp
+                        val libShelfH = if (customCoverW != null)
+                            ((libCoverW.value / 0.7f) + 84f).dp + titlesExtra
+                        else (if (landscape) 204.dp else 230.dp) + titlesExtra
+                        GameShelf(
+                            games = row,
+                            label = label,
+                            rowId = rowIndex + 1,
+                            listItemIndex = firstLibraryRowItem + rowIndex,
+                            coverWidth = libCoverW,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                // Grow the shelf when titles are on so the 2-line
+                                // label + version tag below the cover isn't clipped.
+                                .height(libShelfH),
+                        )
+                    }
                 }
             }
             }
@@ -659,8 +762,13 @@ object GamesList {
         // controller highlight and the confirm action all stay in sync. Built
         // here in composition so the closures capture the live launchers/context;
         // published to the nav model via SideEffect.
-        val toolbarActions: List<Pair<String, () -> Unit>> = buildList {
-            add("Scan" to {
+        val toolbarExpanded = remember { mutableStateOf(false) }
+
+        // (icon, caption, action). The first four are always visible; the rest fold
+        // behind the "⋮ More" toggle. Each caption renders UNDER its icon. Controller
+        // nav sees a flat list that grows/shrinks when the toggle flips.
+        val toolbarActions: List<Triple<String, String, () -> Unit>> = buildList {
+            add(Triple(LibIcons.SEARCH, "Scan") {
                 when {
                     romsDirs.isEmpty() ->
                         Toast.makeText(context, "Choose a game folder first", Toast.LENGTH_SHORT).show()
@@ -673,73 +781,152 @@ object GamesList {
                     }
                 }
             })
-            add("BIOS" to {
+            add(Triple(LibIcons.CPU, "BIOS") {
                 WindowImpl.showLibrary.value = false
                 Main.startBios()
             })
-            add("ELF" to { bootElfLauncher.launch(arrayOf("*/*")) })
-            add("Wall" to { wallLauncher.launch(arrayOf("image/*")) })
-            add((if (CoverArtStyle.use3d.value) "Art: 3D" else "Art: 2D") to {
-                CoverArtStyle.set(!CoverArtStyle.use3d.value)
+            add(Triple(LibIcons.SD_CARD, "Cards") { MemoryCardManager.visible.value = true })
+            add(Triple(
+                if (CoverArtStyle.use3d.value) LibIcons.BOX else LibIcons.PHOTO,
+                if (CoverArtStyle.use3d.value) "Cover 3D" else "Cover 2D",
+            ) { CoverArtStyle.set(!CoverArtStyle.use3d.value) })
+            add(Triple(LibIcons.DOTS, if (toolbarExpanded.value) "Less" else "More") {
+                toolbarExpanded.value = !toolbarExpanded.value
             })
-            if (customBackgroundPath.value != null) {
-                add("Reset" to { resetCustomBackground(context) })
+            if (toolbarExpanded.value) {
+                add(Triple(LibIcons.FILE_CODE, "ELF") { bootElfLauncher.launch(arrayOf("*/*")) })
+                add(Triple(LibIcons.WALLPAPER, "Background") { wallLauncher.launch(arrayOf("image/*")) })
+                if (customBackgroundPath.value != null) {
+                    add(Triple(LibIcons.REFRESH, "Reset BG") { resetCustomBackground(context) })
+                }
+                // Cover-grid size (shelf view only): cycle columns / rows; cover size
+                // adjusts to fit. Captions show the live value (Auto = auto-fit).
+                // Rows control only (covers auto-fit the width). The Columns control
+                // was removed — fewer columns zoomed covers up, which hurt on small
+                // screens; Rows (cover height / how many fit vertically) is the useful knob.
+                if (!LibraryView.listMode.value) {
+                    add(Triple(
+                        LibIcons.LAYOUT_ROWS,
+                        "Rows " + (if (LibraryView.rows.value == 0) "Auto" else LibraryView.rows.value.toString()),
+                    ) { LibraryView.cycleRows() })
+                }
+                add(Triple(LibIcons.TOOL, "Setup") {
+                    SetupImpl.resetForReentry()
+                    Main.reopenSetup()
+                })
             }
-            add("Cards" to { MemoryCardManager.visible.value = true })
-            add("Setup" to {
-                SetupImpl.resetForReentry()
-                Main.reopenSetup()
-            })
         }
-        SideEffect { controllerToolbarActions = toolbarActions }
+        SideEffect { controllerToolbarActions = toolbarActions.map { it.second to it.third } }
         val toolbarFocusIndex =
             if (controllerZone.value == Zone.TOOLBAR) controllerToolbarIndex.value else -1
 
         Row(
             Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             SectionHeader(
                 text = title,
                 modifier = Modifier.weight(1f),
             )
-            toolbarActions.forEachIndexed { idx, (label, action) ->
-                ActionChip(label = label, highlighted = idx == toolbarFocusIndex, onClick = action)
+            toolbarActions.forEachIndexed { idx, (icon, label, action) ->
+                IconActionChip(
+                    iconPath = icon,
+                    label = label,
+                    highlighted = idx == toolbarFocusIndex,
+                    onClick = action,
+                )
             }
         }
     }
 
+    /** Tabler-style outline icon (MIT, github.com/tabler/tabler-icons) drawn from
+     *  its 24x24 SVG path data. Stroked to match the app's hand-drawn glyphs — no
+     *  icon-font / Material-icons dependency, so the (un-minified) APK stays lean. */
     @Composable
-    private fun ActionChip(label: String, highlighted: Boolean = false, onClick: () -> Unit) {
+    private fun TablerIcon(pathData: String, modifier: Modifier = Modifier, tint: Color = Color.White) {
+        val path = remember(pathData) {
+            try {
+                PathParser().parsePathString(pathData).toPath()
+            } catch (_: Exception) {
+                Path()
+            }
+        }
+        Canvas(modifier) {
+            val unit = size.minDimension / 24f
+            scale(unit, unit, pivot = Offset.Zero) {
+                drawPath(
+                    path,
+                    color = tint,
+                    style = Stroke(width = 2f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+                )
+            }
+        }
+    }
+
+    /** Toolbar button: a Tabler icon with a short caption underneath (KamFretoZ's
+     *  request — clearer than a single side label). Tap runs the action; the
+     *  controller-focus glow sits on the icon pill. */
+    @Composable
+    private fun IconActionChip(
+        iconPath: String,
+        label: String,
+        highlighted: Boolean,
+        onClick: () -> Unit,
+    ) {
         val glow = Color(0xFF3DA5FF)
-        Box(
+        Column(
             Modifier
-                .height(34.dp)
-                .then(
-                    if (highlighted)
-                        Modifier.shadow(10.dp, RoundedCornerShape(17.dp), ambientColor = glow, spotColor = glow)
-                    else Modifier
-                )
-                .clip(RoundedCornerShape(17.dp))
-                .background(Color.White.copy(alpha = if (highlighted) 0.20f else 0.10f))
-                .border(
-                    1.dp,
-                    if (highlighted) glow else Color.White.copy(alpha = 0.18f),
-                    RoundedCornerShape(17.dp),
-                )
+                .clip(RoundedCornerShape(10.dp))
                 .clickable(onClick = onClick)
-                .padding(horizontal = 12.dp),
-            contentAlignment = Alignment.Center,
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            Box(
+                Modifier
+                    .height(34.dp)
+                    .widthIn(min = 44.dp)
+                    .then(
+                        if (highlighted)
+                            Modifier.shadow(10.dp, RoundedCornerShape(17.dp), ambientColor = glow, spotColor = glow)
+                        else Modifier
+                    )
+                    .clip(RoundedCornerShape(17.dp))
+                    .background(Color.White.copy(alpha = if (highlighted) 0.20f else 0.10f))
+                    .border(
+                        1.dp,
+                        if (highlighted) glow else Color.White.copy(alpha = 0.18f),
+                        RoundedCornerShape(17.dp),
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                TablerIcon(iconPath, Modifier.size(20.dp), Color.White)
+            }
+            Spacer(Modifier.height(3.dp))
             Text(
                 label,
-                color = Color.White,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
+                color = if (highlighted) Color.White else Color.White.copy(alpha = 0.75f),
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium,
                 maxLines = 1,
             )
         }
+    }
+
+    /** Outline icon path data (24x24 viewBox), from Tabler Icons (MIT). */
+    private object LibIcons {
+        const val SEARCH = "M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0 M21 21l-6 -6"
+        const val CPU = "M5 6a1 1 0 0 1 1 -1h12a1 1 0 0 1 1 1v12a1 1 0 0 1 -1 1h-12a1 1 0 0 1 -1 -1l0 -12 M9 9h6v6h-6l0 -6 M3 10h2 M3 14h2 M10 3v2 M14 3v2 M21 10h-2 M21 14h-2 M14 21v-2 M10 21v-2"
+        const val SD_CARD = "M7 21h10a2 2 0 0 0 2 -2v-14a2 2 0 0 0 -2 -2h-6.172a2 2 0 0 0 -1.414 .586l-3.828 3.828a2 2 0 0 0 -.586 1.414v10.172a2 2 0 0 0 2 2 M13 6v2 M16 6v2 M10 7v1"
+        const val BOX = "M12 3l8 4.5l0 9l-8 4.5l-8 -4.5l0 -9l8 -4.5 M12 12l8 -4.5 M12 12l0 9 M12 12l-8 -4.5"
+        const val PHOTO = "M15 8h.01 M3 6a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v12a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3v-12 M3 16l5 -5c.928 -.893 2.072 -.893 3 0l5 5 M14 14l1 -1c.928 -.893 2.072 -.893 3 0l3 3"
+        const val WALLPAPER = "M8 6h10a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-12 M4 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M8 18v-12a2 2 0 1 0 -4 0v12"
+        const val DOTS = "M11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0 M11 19a1 1 0 1 0 2 0a1 1 0 1 0 -2 0 M11 5a1 1 0 1 0 2 0a1 1 0 1 0 -2 0"
+        const val FILE_CODE = "M14 3v4a1 1 0 0 0 1 1h4 M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2 M10 13l-1 2l1 2 M14 13l1 2l-1 2"
+        const val REFRESH = "M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4 M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"
+        const val TOOL = "M7 10h3v-3l-3.5 -3.5a6 6 0 0 1 8 8l6 6a2 2 0 0 1 -3 3l-6 -6a6 6 0 0 1 -8 -8l3.5 3.5"
+        const val LAYOUT_COLUMNS = "M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1 -1 1h-14a1 1 0 0 1 -1 -1v-14a1 1 0 0 1 1 -1 M12 4v16"
+        const val LAYOUT_ROWS = "M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1 -1 1h-14a1 1 0 0 1 -1 -1v-14a1 1 0 0 1 1 -1 M4 12h16"
     }
 
     @Composable
@@ -759,15 +946,26 @@ object GamesList {
                 verticalArrangement = Arrangement.SpaceBetween,
             ) {
                 NavButton(NavKind.Library, "LIBRARY", active = true) {}
-                InfoButton(
-                    highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 0,
-                ) { infoDialogOpen.value = true }
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    InfoButton(
+                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 0,
+                    ) { infoDialogOpen.value = true }
+                    TitlesToggleButton(
+                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 1,
+                    )
+                    ListViewToggleButton(
+                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 2,
+                    )
+                }
                 Box(Modifier.offset(y = 12.dp)) {
                     NavButton(
                         NavKind.Settings,
                         null,
                         active = false,
-                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 1,
+                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 3,
                     ) { InGameOverlay.openGlobalSettings() }
                 }
             }
@@ -786,14 +984,25 @@ object GamesList {
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 NavButton(NavKind.Library, "LIBRARY", active = true) {}
-                InfoButton(
-                    highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 0,
-                ) { infoDialogOpen.value = true }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    InfoButton(
+                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 0,
+                    ) { infoDialogOpen.value = true }
+                    TitlesToggleButton(
+                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 1,
+                    )
+                    ListViewToggleButton(
+                        highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 2,
+                    )
+                }
                 NavButton(
                     NavKind.Settings,
                     null,
                     active = false,
-                    highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 1,
+                    highlighted = controllerZone.value == Zone.RAIL && railSelection.value == 3,
                 ) { InGameOverlay.openGlobalSettings() }
             }
         }
@@ -885,6 +1094,67 @@ object GamesList {
         }
     }
 
+    /** Left-rail toggle (under the info button) for showing game titles under
+     *  the shelf covers. "Aa" lights up when on; tap flips [LibraryTitles] live.
+     *  [highlighted] draws the controller-focus ring (independent of on/off). */
+    @Composable
+    private fun TitlesToggleButton(highlighted: Boolean = false) {
+        val on = LibraryTitles.show.value
+        val glow = Color(0xFF3DA5FF)
+        Box(
+            Modifier
+                .size(42.dp)
+                .then(
+                    if (highlighted)
+                        Modifier.shadow(10.dp, CircleShape, ambientColor = glow, spotColor = glow)
+                    else Modifier
+                )
+                .clip(CircleShape)
+                .background(if (on || highlighted) glow.copy(alpha = 0.30f) else Color.White.copy(alpha = 0.10f))
+                .then(if (on || highlighted) Modifier.border(1.dp, glow, CircleShape) else Modifier)
+                .clickable { LibraryTitles.set(!on) },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "Aa",
+                color = if (on || highlighted) Color.White else Color.White.copy(alpha = 0.55f),
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+
+    /** Rail button under "Aa": toggle between the cover SHELF view and the compact
+     *  LIST (names-only) view. Filled when list view is active. Long-press cycles
+     *  the shelf grid columns (cover size) for quick tuning without a menu. */
+    @Composable
+    private fun ListViewToggleButton(highlighted: Boolean = false) {
+        val listOn = LibraryView.listMode.value
+        val glow = Color(0xFF3DA5FF)
+        Box(
+            Modifier
+                .size(42.dp)
+                .then(
+                    if (highlighted)
+                        Modifier.shadow(10.dp, CircleShape, ambientColor = glow, spotColor = glow)
+                    else Modifier
+                )
+                .clip(CircleShape)
+                .background(if (listOn || highlighted) glow.copy(alpha = 0.30f) else Color.White.copy(alpha = 0.10f))
+                .then(if (listOn || highlighted) Modifier.border(1.dp, glow, CircleShape) else Modifier)
+                .clickable { LibraryView.toggleListMode() },
+            contentAlignment = Alignment.Center,
+        ) {
+            // ☰ = list view active; ▦ = cover shelf view active.
+            Text(
+                if (listOn) "☰" else "▦",
+                color = if (listOn || highlighted) Color.White else Color.White.copy(alpha = 0.55f),
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+
     /** Help text shown when the rail's info button is tapped. Full-screen scrim
      *  + a scrollable card so it fits the smallest displays. Tap anywhere (or
      *  press B / back on a controller) to dismiss. */
@@ -924,10 +1194,43 @@ object GamesList {
                 )
                 InfoParagraph(
                     "In-game menu",
-                    "While in a game, tap the top-right of the screen to pop up the gear " +
+                    "While in a game, tap the top-middle of the screen to pop up the gear " +
                         "icon — tap it to open the pause overlay. On a controller, you can " +
                         "bind hotkeys for the menu and many other toggles in Settings.",
                 )
+                // Open / copy the app data folder (memory cards, custom textures, etc.).
+                val ctx = LocalContext.current
+                val dataPath = remember {
+                    Main.systemDirPosix() ?: ctx.getExternalFilesDir(null)?.absolutePath ?: ""
+                }
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 14.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF16202C))
+                        .clickable { openOrCopyDataFolder(ctx) }
+                        .padding(12.dp),
+                ) {
+                    Text(
+                        "Open data folder",
+                        color = Colors.pasx2_blue,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Manage memory cards, custom textures, and other files. Tap to open it in " +
+                            "a file manager (or copy the path if none can open it).",
+                        color = Color.White.copy(alpha = 0.72f),
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                    )
+                    if (dataPath.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(dataPath, color = Color.White.copy(alpha = 0.5f), fontSize = 10.sp)
+                    }
+                }
                 Spacer(Modifier.height(18.dp))
                 Text(
                     "Tap anywhere or press B to close",
@@ -956,6 +1259,41 @@ object GamesList {
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
             )
+        }
+    }
+
+    /** Best-effort: open the app data folder in a file manager; if nothing can
+     *  handle it (common on newer Android for Android/data), copy the path to
+     *  the clipboard so the user can paste it. Avoids MANAGE_EXTERNAL_STORAGE
+     *  (removed for Play compliance) — uses a documents URI + clipboard. */
+    private fun openOrCopyDataFolder(context: android.content.Context) {
+        val path = Main.systemDirPosix()
+            ?: context.getExternalFilesDir(null)?.absolutePath ?: ""
+        val opened = runCatching {
+            val docId = "primary:Android/data/${context.packageName}/files"
+            val uri = android.provider.DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents", docId)
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, android.provider.DocumentsContract.Document.MIME_TYPE_DIR)
+                addFlags(
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            context.startActivity(intent)
+            true
+        }.getOrDefault(false)
+        if (!opened) {
+            runCatching {
+                val cb = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as android.content.ClipboardManager
+                cb.setPrimaryClip(android.content.ClipData.newPlainText("ARMSX2 data folder", path))
+            }
+            android.widget.Toast.makeText(
+                context,
+                "No file manager could open it here. Path copied:\n$path",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
         }
     }
 
@@ -1144,6 +1482,62 @@ object GamesList {
     }
 
     @OptIn(ExperimentalFoundationApi::class)
+    /** A single full-width name row for the compact LIST view (no cover art) —
+     *  built for fast finding on small screens. Shares the grid controller-nav
+     *  model (perRow == 1, so each list row is its own controller row at column 0)
+     *  and the same tap-to-launch / long-press-for-settings gestures as a card. */
+    @Composable
+    private fun ListGameRow(game: GameInfo, rowId: Int) {
+        var rowFocused by remember { mutableStateOf(false) }
+        val glowBlue = Color(0xFF3DA5FF)
+        val selectedUri = controllerSelectedUri.value
+        val gridFocused = controllerZone.value == Zone.GRID
+        val highlighted = rowFocused ||
+            (gridFocused && selectedUri == game.uri.toString() && controllerCellSelected(rowId, 0))
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(46.dp)
+                .onFocusChanged {
+                    rowFocused = it.isFocused
+                    if (it.isFocused) selectControllerCell(rowId, 0, game.uri.toString())
+                }
+                .clip(RoundedCornerShape(6.dp))
+                .background(if (highlighted) glowBlue.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.04f))
+                .then(if (highlighted) Modifier.border(2.dp, glowBlue, RoundedCornerShape(6.dp)) else Modifier)
+                .combinedClickable(
+                    onClick = { launchGame(game) },
+                    onLongClick = { InGameOverlay.openGameSettings(game) },
+                )
+                .padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            game.regionFlag?.let { flag ->
+                Text(flag, fontSize = 16.sp, maxLines = 1, modifier = Modifier.padding(end = 10.dp))
+            }
+            Text(
+                game.title,
+                color = Color.White.copy(alpha = if (highlighted) 1f else 0.88f),
+                fontFamily = TitleFont,
+                fontSize = 18.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            game.versionTag?.let { tag ->
+                Text(
+                    tag,
+                    color = Color.White.copy(alpha = 0.4f),
+                    fontFamily = TitleFont,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
+            }
+        }
+    }
+
+    @OptIn(ExperimentalFoundationApi::class)
     @Composable
     private fun ShelfGameCard(
         game: GameInfo,
@@ -1238,6 +1632,39 @@ object GamesList {
                         .padding(top = 6.dp),
                 )
             }
+            // Optional game title under the cover, toggled from the left rail.
+            if (LibraryTitles.show.value) {
+                Text(
+                    game.title,
+                    color = Color.White.copy(alpha = 0.9f),
+                    fontFamily = TitleFont,
+                    fontSize = 12.sp,
+                    lineHeight = 13.sp,
+                    maxLines = 2,
+                    textAlign = TextAlign.Center,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 2.dp, end = 2.dp, top = 3.dp),
+                )
+                // Version/edition tag (disc version from the filename, else serial)
+                // so two copies of the same game are distinguishable.
+                game.versionTag?.let { tag ->
+                    Text(
+                        tag,
+                        color = Color.White.copy(alpha = 0.45f),
+                        fontFamily = TitleFont,
+                        fontSize = 10.sp,
+                        lineHeight = 11.sp,
+                        maxLines = 1,
+                        textAlign = TextAlign.Center,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 2.dp, end = 2.dp),
+                    )
+                }
+            }
         }
     }
 
@@ -1254,7 +1681,11 @@ object GamesList {
         controllerSelectedUri.value = game.uri.toString()
         WindowImpl.showLibrary.value = false
         markRecentlyPlayed(game)
-        Main.launchGame(game.uri.toString(), game)
+        // Raw-mode games (all-files build) carry a file:// URI — hand the core the
+        // bare /storage path so CDVD opens it directly, not via the SAF FD bridge.
+        val launchArg = if (game.uri.scheme == "file") (game.uri.path ?: game.uri.toString())
+            else game.uri.toString()
+        Main.launchGame(launchArg, game)
     }
 
     private fun updateControllerLayout(controllerRowsForUi: List<ControllerGameRow>) {
@@ -1625,16 +2056,38 @@ object GamesList {
                 .background(Color(0xFF1B1A1A).copy(alpha = 0.3f)),
             contentAlignment = Alignment.Center,
         ) {
+            // A user-set custom cover wins over the online repo — and is the only
+            // cover source for serial-less games (homebrew, ELF ports). Resolved
+            // SYNCHRONOUSLY from the preloaded index (customCoverMap), so cover
+            // tiles don't each do their own dir listing during a scroll.
+            val custom = remember(game.uri, customCoverMap.value) {
+                CustomCovers.matchIn(customCoverMap.value, game)
+            }
             val coverUrl = game.coverUrl
-            if (coverUrl != null) {
+            if (custom != null) {
+                val scale = when (game.platform) {
+                    GamePlatform.PS2 -> ContentScale.Crop
+                    GamePlatform.PS1 -> ContentScale.Fit
+                }
+                AsyncImage(
+                    model = ImageRequest.Builder(context).data(custom).crossfade(true).build(),
+                    contentDescription = "${game.title} cover",
+                    contentScale = scale,
+                    alignment = Alignment.Center,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else if (coverUrl != null) {
                 val use3d = CoverArtStyle.use3d.value // re-key cache on style change
                 val coverFile = remember(game.serial, game.platform, use3d) { coverFileFor(context, game) }
-                val localCoverReady = remember(coverFile?.absolutePath) {
-                    mutableStateOf(coverFile?.let { it.exists() && it.length() > 0L } == true)
-                }
+                // Resolve the local cover entirely off the main thread — the
+                // exists()/length() stat and any download previously ran during
+                // composition, hitching the scroll as tiles streamed in.
+                val localCoverReady = remember(coverFile?.absolutePath) { mutableStateOf(false) }
                 LaunchedEffect(coverUrl, coverFile?.absolutePath) {
-                    if (!localCoverReady.value && coverFile != null) {
-                        localCoverReady.value = mirrorCoverToFile(coverUrl, coverFile)
+                    val file = coverFile ?: return@LaunchedEffect
+                    localCoverReady.value = withContext(Dispatchers.IO) {
+                        if (file.exists() && file.length() > 0L) true
+                        else mirrorCoverToFile(coverUrl, file)
                     }
                 }
                 // SubcomposeAsyncImage so we can render a real fallback
@@ -1655,27 +2108,45 @@ object GamesList {
                     GamePlatform.PS1 -> ContentScale.Fit
                 }
                 val coverModel: Any = if (localCoverReady.value && coverFile != null) coverFile else coverUrl
-                SubcomposeAsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(coverModel)
-                        .crossfade(true)
-                        .build(),
-                    contentDescription = "${game.title} cover",
-                    contentScale = scale,
-                    alignment = Alignment.Center,
-                    modifier = Modifier.fillMaxSize(),
-                    loading = { CoverLoadingTile() },
-                    error = { NoCoverTile(missingSerial = false) },
-                )
+                // AsyncImage, NOT SubcomposeAsyncImage: the latter sub-composes per
+                // tile and, paired with the animated CircularProgressIndicator
+                // loading slot, made the library scroll janky once a lot of games
+                // were on screen (continuous invalidation per loading tile). AsyncImage
+                // has no per-item subcomposition and downsamples to the tile size; the
+                // Box's dark background shows during load (no spinner), and on a 404 we
+                // flip to the no-cover fallback once via onError.
+                val coverFailed = remember(coverModel) { mutableStateOf(false) }
+                if (coverFailed.value) {
+                    NoCoverTile(missingSerial = false)
+                } else {
+                    AsyncImage(
+                        model = ImageRequest.Builder(context)
+                            .data(coverModel)
+                            .crossfade(true)
+                            .build(),
+                        contentDescription = "${game.title} cover",
+                        contentScale = scale,
+                        alignment = Alignment.Center,
+                        modifier = Modifier.fillMaxSize(),
+                        onError = { coverFailed.value = true },
+                    )
+                }
             } else {
                 NoCoverTile(missingSerial = true)
             }
         }
     }
 
+    // Covers dir. Delegates to CustomCovers.coversRoot so remote AND custom covers
+    // resolve to the SAME cached root — Main.assetCopyRoot can flip between the
+    // system dir and the app-private fallback on a transient write-probe, and a
+    // per-call resolve made custom covers land in a different dir than they were
+    // saved to. One shared cache keeps them consistent (and off the per-tile path).
+    private fun coversDir(context: Context): File = CustomCovers.coversRoot(context)
+
     private fun coverFileFor(context: Context, game: GameInfo): File? {
         val serial = game.serial ?: return null
-        val coversDir = File(Main.assetCopyRoot(context), "covers")
+        val coversDir = coversDir(context)
         // Cache each style separately so toggling 2D/3D doesn't reuse the
         // wrong cached image.
         return if (CoverArtStyle.use3d.value)
@@ -1873,6 +2344,16 @@ object GamesList {
                 val collected = linkedMapOf<String, GameInfo>() // URI → info, preserves first-seen order
                 for (dirUri in romsUriStrings) {
                     val uri = try { Uri.parse(dirUri) } catch (_: Exception) { null } ?: continue
+                    // All-files build: walk the folder by raw path (the SAF grant is
+                    // evicted while All-Files Access is held). Falls back to SAF when
+                    // the tree URI can't be resolved to a real path.
+                    if (allFilesRomMode()) {
+                        val root = Main.resolveTreeUriToPosix(dirUri)?.let { File(it) }
+                        if (root != null && root.isDirectory) {
+                            scanTreeRawInto(root, collected, 0)
+                            continue
+                        }
+                    }
                     val tree = DocumentFile.fromTreeUri(context, uri) ?: continue
                     scanTreeInto(context, tree, collected, 0)
                 }
@@ -1973,6 +2454,60 @@ object GamesList {
             val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
             val fd = pfd.detachFd()
             NativeApp.getGameSerialFromFd(fd) // consumes fd
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Raw-path counterpart of [scanTreeInto] for the all-files build. Walks the
+     *  folder with java.io.File and tags each game with a file:// URI so the
+     *  launch/probe paths open it directly instead of via the SAF FD bridge. */
+    private fun scanTreeRawInto(
+        dir: File,
+        collected: MutableMap<String, GameInfo>,
+        depth: Int,
+    ) {
+        if (depth > MAX_SCAN_DEPTH) return
+        val entries = try { dir.listFiles() } catch (_: Exception) { null } ?: return
+        for (f in entries) {
+            if (f.isDirectory) {
+                scanTreeRawInto(f, collected, depth + 1)
+                continue
+            }
+            val name = f.name
+            val ext = name.substringAfterLast('.', "").lowercase()
+            if (ext !in GAME_EXTENSIONS) continue
+            val fileUri = Uri.fromFile(f)
+            val rawProbe = when (ext) {
+                "iso", "bin", "chd", "img", "mdf", "nrg", "dump" -> probeDiscSerialRaw(f)
+                else -> null
+            }
+            val (probeSerial, probePlatform) = parseProbeResult(rawProbe)
+            val (titleFromName, serialFromName) = FilenameParser.parse(name)
+            val finalSerial = probeSerial ?: serialFromName
+            val finalPlatform = probePlatform ?: GamePlatform.PS2
+            val compatRaw = if (finalSerial != null)
+                NativeApp.getCompatibilityForSerial(finalSerial) else 0
+            val compatStars = (compatRaw - 1).coerceIn(0, 5)
+            collected.putIfAbsent(
+                fileUri.toString(),
+                GameInfo(
+                    uri = fileUri,
+                    title = titleFromName,
+                    serial = finalSerial,
+                    compatibility = compatStars,
+                    extension = ext.uppercase(),
+                    platform = finalPlatform,
+                ),
+            )
+        }
+    }
+
+    /** Open a real file for read and hand the fd to native for the serial probe. */
+    private fun probeDiscSerialRaw(file: File): String? {
+        return try {
+            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            NativeApp.getGameSerialFromFd(pfd.detachFd()) // consumes fd
         } catch (_: Exception) {
             null
         }

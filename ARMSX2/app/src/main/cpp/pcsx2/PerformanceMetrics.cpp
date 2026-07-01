@@ -18,6 +18,7 @@
 static const float UPDATE_INTERVAL = 0.5f;
 
 static float s_fps = 0.0f;
+static float s_present_fps = 0.0f;
 static float s_internal_fps = 0.0f;
 static float s_minimum_frame_time = 0.0f;
 static float s_minimum_frame_time_accumulator = 0.0f;
@@ -155,6 +156,9 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	s_average_frame_time = std::exchange(s_average_frame_time_accumulator, 0.0f) / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_maximum_frame_time = std::exchange(s_maximum_frame_time_accumulator, 0.0f);
 	s_fps = static_cast<float>(s_frames_since_last_update) / time;
+	// Actual presented frame rate (excludes skipped presents — e.g. the Android
+	// Max-FPS cap / frameskip). Lets the OSD show what's really on screen.
+	s_present_fps = static_cast<float>(s_presents_since_last_update) / time;
 	s_average_gpu_time = s_accumulated_gpu_time / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_gpu_usage = s_accumulated_gpu_time / (time * 10.0f);
 	s_accumulated_gpu_time = 0.0f;
@@ -270,6 +274,11 @@ bool PerformanceMetrics::IsInternalFPSValid()
 float PerformanceMetrics::GetFPS()
 {
 	return s_fps;
+}
+
+float PerformanceMetrics::GetPresentFPS()
+{
+	return s_present_fps;
 }
 
 float PerformanceMetrics::GetInternalFPS()

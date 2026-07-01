@@ -61,6 +61,12 @@ object MemoryCardManager {
     val visible = mutableStateOf(false)
     private val files = mutableStateListOf<File>()
     private val status = mutableStateOf<String?>(null)
+    // Which card file is bound to each slot, so the list can mark the active
+    // cards. Read from the persisted global config; updated on assign.
+    private val slot1Filename = mutableStateOf("")
+    private val slot2Filename = mutableStateOf("")
+    private val slot1Enabled = mutableStateOf(false)
+    private val slot2Enabled = mutableStateOf(false)
 
     @Composable
     fun Render() {
@@ -69,6 +75,8 @@ object MemoryCardManager {
         var newName by remember { mutableStateOf("") }
         var newType by remember { mutableStateOf(1) }  // 1 = File, 2 = Folder
         var newSize by remember { mutableStateOf(1) }  // 1=8MB 2=16 3=32 4=64
+        // Card pending a delete-confirm (file name), so a single tap can't wipe saves.
+        var deleteArmed by remember { mutableStateOf<String?>(null) }
         val dialogScroll = rememberScrollState()
         val maxDialogHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
         val nameFocus = remember { FocusRequester() }
@@ -84,7 +92,7 @@ object MemoryCardManager {
             contract = ActivityResultContracts.GetContent()
         ) { uri: Uri? ->
             if (uri != null) {
-                importSlot1(context, uri)
+                importCardFile(context, uri)
                 refresh(context)
             }
         }
@@ -92,7 +100,7 @@ object MemoryCardManager {
             contract = ActivityResultContracts.OpenDocumentTree()
         ) { uri: Uri? ->
             if (uri != null) {
-                importFolderCardSlot1(context, uri)
+                importFolder(context, uri)
                 refresh(context)
             }
         }
@@ -182,14 +190,6 @@ object MemoryCardManager {
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text("Use Default Slots")
-                    }
-                    Button(
-                        onClick = { refresh(context) },
-                        modifier = Modifier.controllerFocusable("mc:refresh", onConfirm = { refresh(context) }),
-                        colors = darkButtonColors(),
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Text("Refresh")
                     }
                 }
 
@@ -305,10 +305,18 @@ object MemoryCardManager {
                             .padding(8.dp),
                     ) {
                         files.forEach { file ->
+                            val inSlot1 = slot1Enabled.value && file.name.equals(slot1Filename.value, ignoreCase = true)
+                            val inSlot2 = slot2Enabled.value && file.name.equals(slot2Filename.value, ignoreCase = true)
+                            val active = inSlot1 || inSlot2
                             Row(
                                 Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 5.dp),
+                                    .then(
+                                        if (active)
+                                            Modifier.background(Color(0xFF14361F), RoundedCornerShape(6.dp))
+                                        else Modifier
+                                    )
+                                    .padding(vertical = 5.dp, horizontal = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
@@ -319,6 +327,20 @@ object MemoryCardManager {
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.weight(1f),
                                 )
+                                if (active) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        when {
+                                            inSlot1 && inSlot2 -> "● SLOTS 1 & 2"
+                                            inSlot1 -> "● SLOT 1"
+                                            else -> "● SLOT 2"
+                                        },
+                                        color = Color(0xFF6FCF7F),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                    )
+                                }
                                 Spacer(Modifier.width(8.dp))
                                 Text(
                                     if (file.isDirectory) "Folder" else readableSize(file.length()),
@@ -334,7 +356,7 @@ object MemoryCardManager {
                                         .height(32.dp)
                                         .controllerFocusable("mc:slot1:${file.name}", onConfirm = { assignSlot(context, 1, file) }),
                                 ) {
-                                    Text("Slot 1", fontSize = 11.sp)
+                                    Text(if (inSlot1) "✓ Slot 1" else "Slot 1", fontSize = 11.sp)
                                 }
                                 Spacer(Modifier.width(6.dp))
                                 Button(
@@ -345,7 +367,28 @@ object MemoryCardManager {
                                         .height(32.dp)
                                         .controllerFocusable("mc:slot2:${file.name}", onConfirm = { assignSlot(context, 2, file) }),
                                 ) {
-                                    Text("Slot 2", fontSize = 11.sp)
+                                    Text(if (inSlot2) "✓ Slot 2" else "Slot 2", fontSize = 11.sp)
+                                }
+                                Spacer(Modifier.width(6.dp))
+                                val armed = deleteArmed == file.name
+                                Button(
+                                    onClick = {
+                                        if (armed) { deleteCard(context, file); deleteArmed = null }
+                                        else deleteArmed = file.name
+                                    },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (armed) Color(0xFFC62828) else Color(0xFF2A2A2A),
+                                        contentColor = Color.White,
+                                    ),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier
+                                        .height(32.dp)
+                                        .controllerFocusable("mc:del:${file.name}", onConfirm = {
+                                            if (armed) { deleteCard(context, file); deleteArmed = null }
+                                            else deleteArmed = file.name
+                                        }),
+                                ) {
+                                    Text(if (armed) "Sure?" else "Delete", fontSize = 11.sp)
                                 }
                             }
                         }
@@ -354,7 +397,7 @@ object MemoryCardManager {
 
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "File imports are copied to Mcd001.ps2. Folder imports are copied as folder cards. Existing .ps2/.mcr files and folder cards can be assigned to either slot.",
+                    "Import File adds a memory card (then tap Slot 1 or Slot 2 to use it). Import Folder imports .ps2/.mcr cards found in a folder, or the folder itself as a folder memory card. Delete removes a card and clears its slot.",
                     color = Color(0xFF888888),
                     fontSize = 11.sp,
                 )
@@ -370,17 +413,32 @@ object MemoryCardManager {
             ?.filter { it.isFile || it.isDirectory }
             ?.sortedWith(compareBy<File> { !it.name.endsWith(".ps2", ignoreCase = true) }.thenBy { it.name.lowercase() })
             ?.let { files.addAll(it) }
+        readSlotState()
     }
 
-    private fun importSlot1(context: Context, uri: Uri) {
+    /** Refresh the cached per-slot bindings shown as the "active" markers. */
+    private fun readSlotState() {
+        val g = ConfigStore.loadGlobal()
+        slot1Filename.value = g.memoryCardSlot1Filename
+        slot2Filename.value = g.memoryCardSlot2Filename
+        slot1Enabled.value = g.memoryCardSlot1Enabled
+        slot2Enabled.value = g.memoryCardSlot2Enabled
+    }
+
+    private fun importCardFile(context: Context, uri: Uri) {
         val dir = memcardsDir(context).apply { mkdirs() }
-        val outFile = File(dir, "Mcd001.ps2")
+        // Keep the source filename (unique-ified) instead of always writing
+        // Mcd001.ps2 — re-importing previously OVERWROTE the first card and forced
+        // Slot 1. Now each import is a distinct card the user assigns to a slot.
+        val rawName = runCatching { DocumentFile.fromSingleUri(context, uri)?.name }.getOrNull()
+        var name = sanitizeFileName(rawName?.takeIf { it.isNotBlank() } ?: "Mcd001.ps2")
+        if (!name.endsWith(".ps2", true) && !name.endsWith(".mcr", true)) name += ".ps2"
+        val outFile = uniqueFile(dir, name)
         try {
             context.contentResolver.openInputStream(uri)?.use { ins ->
                 FileOutputStream(outFile).use { outs -> ins.copyTo(outs) }
             } ?: error("Could not open selected file")
-            setDefaultSlots()
-            status.value = "Imported Slot 1 as ${outFile.name}."
+            status.value = "Imported ${outFile.name} — tap Slot 1 or Slot 2 to use it."
             Toast.makeText(context, "Memory card imported", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             status.value = "Import failed: ${e.message ?: "unknown error"}"
@@ -388,7 +446,7 @@ object MemoryCardManager {
         }
     }
 
-    private fun importFolderCardSlot1(context: Context, uri: Uri) {
+    private fun importFolder(context: Context, uri: Uri) {
         val dir = memcardsDir(context).apply { mkdirs() }
         try {
             runCatching {
@@ -400,13 +458,39 @@ object MemoryCardManager {
 
             val source = DocumentFile.fromTreeUri(context, uri)
                 ?: error("Could not open selected folder")
+
+            // Common case: the folder holds loose .ps2/.mcr card FILES — import each
+            // as its own card (the user expected this, not "wrap the folder as one
+            // folder-card"). Only fall back to a folder (directory) memory card when
+            // there are no loose card files.
+            val cardFiles = source.listFiles().filter {
+                it.isFile && (it.name?.endsWith(".ps2", true) == true ||
+                    it.name?.endsWith(".mcr", true) == true)
+            }
+            if (cardFiles.isNotEmpty()) {
+                var imported = 0
+                for (f in cardFiles) {
+                    val out = uniqueFile(dir, sanitizeFileName(f.name ?: continue))
+                    val ok = runCatching {
+                        context.contentResolver.openInputStream(f.uri)?.use { input ->
+                            FileOutputStream(out).use { output -> input.copyTo(output) }
+                        } != null
+                    }.getOrDefault(false)
+                    if (ok && out.isFile && out.length() > 0L) imported++
+                    else runCatching { out.delete() } // drop a partial / failed copy
+                }
+                if (imported == 0) error("Could not read the card files in that folder")
+                status.value = "Imported $imported memory card${if (imported == 1) "" else "s"} — assign one to a slot below."
+                Toast.makeText(context, status.value, Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // No loose card files → import the folder itself as a folder memory card.
             val dest = uniqueChild(dir, sanitizeFileName(source.name ?: "FolderCard"))
             dest.mkdirs()
-
             val copied = copyDocumentFolder(context, source, dest)
             if (copied == 0)
-                error("Selected folder did not contain any files")
-
+                error("Selected folder is empty (no card files or folder-card contents)")
             if (assignSlot(context, 1, dest)) {
                 status.value = "Imported folder card ${dest.name} to Slot 1."
                 Toast.makeText(context, "Folder memory card imported", Toast.LENGTH_SHORT).show()
@@ -442,6 +526,7 @@ object MemoryCardManager {
             NativeApp.setSetting("MemoryCards", "Slot${slot}_Enable", "bool", "true")
             NativeApp.commitSettings()
             persistSlot(slot, file.name)
+            readSlotState()
             status.value = "${file.name} assigned to Slot $slot."
             Toast.makeText(context, status.value, Toast.LENGTH_SHORT).show()
             return true
@@ -464,6 +549,7 @@ object MemoryCardManager {
         NativeApp.setSetting("MemoryCards", "Slot2_Enable", "bool", "true")
         NativeApp.commitSettings()
         persistDefaultSlots()
+        readSlotState()
     }
 
     private fun persistSlot(slot: Int, filename: String) {
@@ -491,6 +577,68 @@ object MemoryCardManager {
                 memoryCardSlot2Filename = "Mcd002.ps2",
             )
         )
+    }
+
+    /** Delete a card file/folder. Any slot pointing at it is cleared FIRST so the
+     *  BIOS doesn't recreate an empty card from a now-stale slot assignment (the
+     *  "deleted card still shows at BIOS boot" bug). */
+    private fun deleteCard(context: Context, file: File) {
+        val g = ConfigStore.loadGlobal()
+        // Case-insensitive, to match the active-card display + the lowercase
+        // default filenames — otherwise the slot isn't cleared and the BIOS
+        // recreates the deleted card from the stale slot assignment.
+        val emptiedSlots = mutableListOf<Int>()
+        if (g.memoryCardSlot1Filename.equals(file.name, ignoreCase = true)) { clearSlot(1); emptiedSlots.add(1) }
+        if (g.memoryCardSlot2Filename.equals(file.name, ignoreCase = true)) { clearSlot(2); emptiedSlots.add(2) }
+        val ok = runCatching {
+            if (file.isDirectory) file.deleteRecursively() else file.delete()
+        }.getOrDefault(false)
+        // A slot the deleted card occupied is restored to its fresh DEFAULT card
+        // (Mcd00N.ps2) instead of being left empty — the user shouldn't have to hit
+        // "Use Default Slots" after a delete (matches NetherSX2). Reassigned AFTER the
+        // delete so the core regenerates a clean card; the deleted card's own name is
+        // gone from every slot, so the BIOS-recreates-the-deleted-card bug stays fixed.
+        if (ok && emptiedSlots.isNotEmpty()) {
+            emptiedSlots.forEach { restoreDefaultSlot(it) }
+            if (Main.nativeReady.value) readSlotState()
+        }
+        status.value = if (ok) "Deleted ${file.name}." else "Could not delete ${file.name}."
+        Toast.makeText(context, status.value, Toast.LENGTH_SHORT).show()
+        refresh(context)
+    }
+
+    /** Reassign one slot to its fresh default card (Mcd00N.ps2). The core recreates
+     *  the file when the slot is enabled, so a slot is never left card-less. */
+    private fun restoreDefaultSlot(slot: Int) {
+        if (!Main.nativeReady.value) return
+        val name = if (slot == 2) "Mcd002.ps2" else "Mcd001.ps2"
+        runCatching {
+            NativeApp.setSetting("MemoryCards", "Slot${slot}_Enable", "bool", "false")
+            NativeApp.setSetting("MemoryCards", "Slot${slot}_Filename", "string", name)
+            NativeApp.setSetting("MemoryCards", "Slot${slot}_Enable", "bool", "true")
+            NativeApp.commitSettings()
+        }
+        persistSlot(slot, name)
+    }
+
+    /** Disable a slot and clear its filename, in both the native config and the
+     *  persisted ConfigStore, so nothing references a removed card. */
+    private fun clearSlot(slot: Int) {
+        runCatching {
+            if (Main.nativeReady.value) {
+                NativeApp.setSetting("MemoryCards", "Slot${slot}_Enable", "bool", "false")
+                NativeApp.setSetting("MemoryCards", "Slot${slot}_Filename", "string", "")
+                NativeApp.commitSettings()
+            }
+        }
+        val cur = ConfigStore.loadGlobal()
+        val updated = when (slot) {
+            1 -> cur.copy(memoryCardSlot1Enabled = false, memoryCardSlot1Filename = "")
+            2 -> cur.copy(memoryCardSlot2Enabled = false, memoryCardSlot2Filename = "")
+            else -> cur
+        }
+        ConfigStore.saveGlobal(updated)
+        readSlotState()
     }
 
     private fun memcardsDir(context: Context): File =
@@ -521,6 +669,21 @@ object MemoryCardManager {
         var suffix = 2
         while (candidate.exists()) {
             candidate = File(parent, "$base-$suffix")
+            suffix++
+        }
+        return candidate
+    }
+
+    /** Like [uniqueChild] but keeps the file extension (so "Mcd001.ps2" → "Mcd001-2.ps2",
+     *  not "Mcd001.ps2-2"). Used for imported card FILES. */
+    private fun uniqueFile(parent: File, requestedName: String): File {
+        val dot = requestedName.lastIndexOf('.')
+        val base = if (dot > 0) requestedName.substring(0, dot) else requestedName
+        val ext = if (dot > 0) requestedName.substring(dot) else ""
+        var candidate = File(parent, "$base$ext")
+        var suffix = 2
+        while (candidate.exists()) {
+            candidate = File(parent, "$base-$suffix$ext")
             suffix++
         }
         return candidate

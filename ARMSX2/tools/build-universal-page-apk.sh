@@ -42,10 +42,14 @@ build_core() {
 	local page_size="$1"
 	local lib_name="$2"
 	local out_apk="$3"
-	local built_apk="$ROOT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+	# Sideload build = the `github` product flavor (adds MANAGE_EXTERNAL_STORAGE
+	# + STORAGE_ALL_FILES). Flavors qualify the task name and output path with
+	# the flavor, so this is assembleGithubDebug → apk/github/debug/. The Play
+	# AAB uses bundlePlayRelease instead (the play flavor stays SAF-only).
+	local built_apk="$ROOT_DIR/app/build/outputs/apk/github/debug/app-github-debug.apk"
 
 	"$ROOT_DIR/gradlew" -p "$ROOT_DIR" :app:cleanCxx
-	"$ROOT_DIR/gradlew" -p "$ROOT_DIR" :app:assembleDebug \
+	"$ROOT_DIR/gradlew" -p "$ROOT_DIR" :app:assembleGithubDebug \
 		-Parmsx2.hostPageSize="$page_size" \
 		-Parmsx2.nativeLibName="$lib_name"
 

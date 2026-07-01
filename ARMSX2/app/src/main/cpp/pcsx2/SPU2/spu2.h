@@ -51,6 +51,13 @@ void SaveOutputVolume();
 /// Pauses/resumes the output stream.
 void SetOutputPaused(bool paused);
 
+/// When suppressed, SetOutputPaused() becomes a no-op so the audio device is
+/// left running across a transient VM park (e.g. the settings-apply pause).
+/// The stream fills with silence on underrun, so there's no audible artifact,
+/// and we avoid pausing a low-latency stream long enough for the OS to reclaim
+/// it (which on Android left audio dead until a manual menu resume).
+void SetOutputPauseSuppressed(bool suppressed);
+
 /// Clears output buffers in no-sync mode, prevents long delays after fast forwarding.
 void OnTargetSpeedChanged();
 

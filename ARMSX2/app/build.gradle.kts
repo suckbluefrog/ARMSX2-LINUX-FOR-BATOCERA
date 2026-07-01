@@ -1,3 +1,6 @@
+import org.gradle.api.GradleException
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
@@ -5,6 +8,22 @@ plugins {
 
 val armsx2NativeLibName = providers.gradleProperty("armsx2.nativeLibName").orElse("emucore_4k")
 val armsx2HostPageSize = providers.gradleProperty("armsx2.hostPageSize").orElse("0x1000")
+val armsx2ApplicationId = providers.gradleProperty("armsx2.applicationId").orElse("com.armsx2")
+val armsx2VersionCode = providers.gradleProperty("armsx2.versionCode").map { it.toInt() }.orElse(17)
+val armsx2VersionName = providers.gradleProperty("armsx2.versionName").orElse("1.0-overlay-3")
+val armsx2SigningPropertiesFile = rootProject.file("armsx2_keystore.properties")
+val armsx2SigningProperties = Properties().apply {
+    if (armsx2SigningPropertiesFile.isFile) {
+        armsx2SigningPropertiesFile.inputStream().use(::load)
+    }
+}
+fun armsx2SigningProperty(name: String): String? = armsx2SigningProperties.getProperty(name)?.takeIf { it.isNotBlank() }
+val armsx2PlaySigningReady = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { armsx2SigningProperty(it) != null }
+
+if (armsx2SigningPropertiesFile.isFile && !armsx2PlaySigningReady) {
+    throw GradleException("armsx2_keystore.properties is missing one or more required signing keys.")
+}
 
 android {
     namespace = "com.armsx2"
@@ -15,15 +34,24 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.armsx2"
+        applicationId = armsx2ApplicationId.get()
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
-        versionName = "1.0-overlay"
+        versionCode = armsx2VersionCode.get()
+        versionName = armsx2VersionName.get()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters.add("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        create("playRelease") {
+            armsx2SigningProperty("storeFile")?.let { storeFile = rootProject.file(it) }
+            storePassword = armsx2SigningProperty("storePassword")
+            keyAlias = armsx2SigningProperty("keyAlias")
+            keyPassword = armsx2SigningProperty("keyPassword")
         }
     }
 
@@ -34,7 +62,11 @@ android {
             // without a separate signing config. NOT for distribution — the debug
             // keystore is well-known and not secure for Play Store uploads.
             // Replace with a real release signingConfig before publishing.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (armsx2PlaySigningReady) {
+                signingConfigs.getByName("playRelease")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -75,6 +107,25 @@ android {
                     arguments += "-DCMAKE_CXX_FLAGS=-O3 -g"
                 }
             }
+        }
+    }
+    // Distribution split: the Play AAB (play flavor) stays scoped-storage /
+    // SAF only — src/main/AndroidManifest.xml has NO MANAGE_EXTERNAL_STORAGE,
+    // so play is Play-policy clean by construction. The sideloaded GitHub APK
+    // (github flavor) merges src/github/AndroidManifest.xml, which adds
+    // MANAGE_EXTERNAL_STORAGE back, and STORAGE_ALL_FILES gates the runtime
+    // all-files / custom-folder path in the setup wizard. applicationId is left
+    // to defaultConfig (driven by -Parmsx2.applicationId) so both flavors honor
+    // the release/AAB pipeline's CLI override.
+    flavorDimensions += "store"
+    productFlavors {
+        create("github") {
+            dimension = "store"
+            buildConfigField("boolean", "STORAGE_ALL_FILES", "true")
+        }
+        create("play") {
+            dimension = "store"
+            buildConfigField("boolean", "STORAGE_ALL_FILES", "false")
         }
     }
     compileOptions {

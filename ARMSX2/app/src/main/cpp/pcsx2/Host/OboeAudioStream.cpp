@@ -11,6 +11,8 @@
 #include "oboe/Oboe.h"
 
 #include <atomic>
+#include <chrono>
+#include <thread>
 #if defined(__ANDROID__)
 #include <sched.h>
 #include <sys/syscall.h>
@@ -43,6 +45,12 @@ namespace {
 		bool m_stop_requested = false;
 
 		std::shared_ptr<oboe::AudioStream> m_stream;
+
+		// Performance mode the stream is (re)opened with. Starts at LowLatency;
+		// Initialize() downgrades it to None if the device refuses the fast path
+		// (some Adreno/AAudio devices fail requestStart() with ErrorDisconnected
+		// at boot). onError()'s reopen then reuses whatever mode actually worked.
+		oboe::PerformanceMode m_perf_mode = oboe::PerformanceMode::LowLatency;
 
 		// Affinity pin latch. Oboe spawns its own audio data thread; we don't
 		// see its TID until the callback fires the first time. After the
@@ -141,11 +149,39 @@ bool OboeAudioStream::Initialize(bool stretch_enabled)
 	}};
 	BaseInitialize(sample_readers[static_cast<size_t>(m_parameters.expansion_mode)], stretch_enabled);
 
-	if (!Open())
-		return false;
-	if (!Start())
-		return false;
-	return true;
+	// Resilient open: some devices (seen on Adreno/AAudio) refuse a low-latency /
+	// fast-path output stream at boot and fail requestStart() with
+	// ErrorDisconnected — the audio device was reclaimed the instant we tried to
+	// start it. Rather than fall straight to permanent silent null output, retry,
+	// and if the fast path keeps failing drop to the most compatible
+	// PerformanceMode::None (shared slow-path) stream before giving up.
+	static constexpr oboe::PerformanceMode kModes[] = {
+		oboe::PerformanceMode::LowLatency,
+		oboe::PerformanceMode::None,
+	};
+	for (const oboe::PerformanceMode mode : kModes)
+	{
+		m_perf_mode = mode;
+		for (int attempt = 0; attempt < 2; attempt++)
+		{
+			if (Open() && Start())
+			{
+				if (mode != oboe::PerformanceMode::LowLatency || attempt != 0)
+					Console.WriteLn("(Oboe) Audio stream opened with performance mode %d (attempt %d).",
+						static_cast<int>(mode), attempt);
+				return true;
+			}
+			// Open() failed, or Open() succeeded but Start() failed: tear the
+			// half-open stream down before the next attempt / mode, then pause
+			// briefly to let a transient device-reclaim settle.
+			Close();
+			std::this_thread::sleep_for(std::chrono::milliseconds(60));
+		}
+		Console.Warning("(Oboe) performance mode %d failed; trying a more compatible mode...",
+			static_cast<int>(mode));
+	}
+	Console.Error("(Oboe) All open/start attempts failed; audio will be silent.");
+	return false;
 }
 
 bool OboeAudioStream::Open()
@@ -158,7 +194,7 @@ bool OboeAudioStream::Open()
 
 	oboe::AudioStreamBuilder builder;
 	builder.setDirection(oboe::Direction::Output);
-	builder.setPerformanceMode(oboe::PerformanceMode::LowLatency);
+	builder.setPerformanceMode(m_perf_mode);
 	builder.setSharingMode(oboe::SharingMode::Shared);
 	builder.setFormat(oboe::AudioFormat::Float);
 	builder.setSampleRate(m_sample_rate);
@@ -231,16 +267,24 @@ void OboeAudioStream::SetPaused(bool paused)
 
 	if (paused)
 	{
-		oboe::Result result = m_stream->requestPause();
-		if (result != oboe::Result::OK)
+		if (m_stream)
 		{
-			Console.Error("(Oboe) requestPause() failed: %d", result);
-			return;
+			oboe::Result result = m_stream->requestPause();
+			if (result != oboe::Result::OK)
+				Console.Error("(Oboe) requestPause() failed: %d", result);
 		}
+		// Mark not-playing even if requestPause() failed, so the paused/
+		// playing bookkeeping can't desync and strand a later resume.
 		m_playing = false;
 	}
 	else
 	{
+		// Resume must be authoritative. If m_playing desynced to true (e.g.
+		// an error-recovery reopen ran while we thought the stream was
+		// paused), Start()'s `if (m_playing) return true;` guard would
+		// swallow the restart and leave audio dead. Clear it first so the
+		// resume always actually re-issues requestStart().
+		m_playing = false;
 		Start();
 	}
 	m_paused = paused;

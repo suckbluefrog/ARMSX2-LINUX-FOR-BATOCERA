@@ -485,6 +485,42 @@ u32 GSGetManualFrameSkip()
 	return s_manual_frameskip.load(std::memory_order_relaxed);
 }
 
+// Max presented-FPS cap (Android). Caps the DISPLAY frame rate without slowing
+// emulation — read on the GS thread in GSRenderer::VSync, which drops a present
+// only when ahead of the target interval (adaptive, no over-skip). 0 = off.
+// s_max_present_fps is the cap value (for the OSD label); s_max_present_interval
+// is the vsync-aligned minimum present spacing in CPU ticks, computed in
+// native-lib setFpsCap where the native refresh is known, so display rates snap
+// to whole vsync multiples (60/30/20/15…) and hold steady at the boundary.
+static std::atomic<u32> s_max_present_fps{0};
+static std::atomic<u64> s_max_present_interval{0};
+// Fast-forward (Turbo) bypasses the present cap so the speed-up is visible. Set
+// from the limiter-mode JNI (Turbo → true, anything else → false) and read on
+// the GS thread in GSRenderer::VSync. Unlimited (frame-limit-off steady state)
+// deliberately does NOT set this — there the present cap is still wanted.
+static std::atomic<bool> s_present_cap_suspended{false};
+void GSSetMaxPresentFps(u32 fps, u64 present_interval)
+{
+	s_max_present_fps.store(fps, std::memory_order_relaxed);
+	s_max_present_interval.store(present_interval, std::memory_order_relaxed);
+}
+u32 GSGetMaxPresentFps()
+{
+	return s_max_present_fps.load(std::memory_order_relaxed);
+}
+u64 GSGetMaxPresentInterval()
+{
+	return s_max_present_interval.load(std::memory_order_relaxed);
+}
+void GSSetPresentCapSuspended(bool suspended)
+{
+	s_present_cap_suspended.store(suspended, std::memory_order_relaxed);
+}
+bool GSGetPresentCapSuspended()
+{
+	return s_present_cap_suspended.load(std::memory_order_relaxed);
+}
+
 void GSvsync(u32 field, bool registers_written)
 {
 	// Update this here because we need to check if the pending draw affects the current frame, so our regs need to be updated.
@@ -780,7 +816,7 @@ void GSgetStats(SmallStringBase& info)
 				(int)std::ceil(pm.Get(GSPerfMon::RenderPasses)),
 				(int)std::ceil(pm.Get(GSPerfMon::Readbacks)),
 				(int)std::ceil(pm.Get(GSPerfMon::TextureCopies)),
-				(int)std::ceil(pm.Get(GSPerfMon::DepthCopiesROV)),
+				(int)std::ceil(pm.Get(GSPerfMon::TextureCopiesROV)),
 				(int)std::ceil(pm.Get(GSPerfMon::TextureUploads)));
 		}
 	}

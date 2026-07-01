@@ -1,7 +1,9 @@
 package com.armsx2.ui.settings
 
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -10,7 +12,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -43,7 +49,7 @@ fun FixesTab(state: MutableState<Settings>) {
             .fillMaxWidth()
             .verticalScroll(scroll),
     ) {
-        SectionHeader("Display Fixes")
+        CollapsibleSection("Display Fixes") {
         HelpText(
             "PCRTC / presentation fixes for the displayed image. Anti-Blur is on by " +
                 "default; the rest are off unless a game needs them.",
@@ -140,8 +146,9 @@ fun FixesTab(state: MutableState<Settings>) {
             description = "Frames the GS thread may queue ahead. Higher can smooth pacing; adds latency.",
             onChange = { apply(s.copy(vsyncQueueSize = it)) },
         )
+        }
 
-        SectionHeader("Upscaling Fixes")
+        CollapsibleSection("Upscaling Fixes") {
         HelpText(
             "Only active when upscaling above Native. They reduce alignment/seam " +
                 "artifacts but won't remove every bloom or glow.",
@@ -221,8 +228,9 @@ fun FixesTab(state: MutableState<Settings>) {
             description = "Vertical texture-coordinate offset. 0 unless a game needs it.",
             onChange = { apply(s.copy(textureOffsetY = it)) },
         )
+        }
 
-        SectionHeader("Hardware Fixes")
+        CollapsibleSection("Hardware Fixes") {
         HelpText(
             "Manual renderer hacks. The master toggle auto-enables when any fix is " +
                 "set. Leave these off unless fixing a specific visual issue.",
@@ -381,8 +389,9 @@ fun FixesTab(state: MutableState<Settings>) {
             s.spinCpuReadbacks,
             description = "Busy-waits the CPU on readbacks to reduce stalls. Can raise power use.",
         ) { apply(s.copy(spinCpuReadbacks = it)) }
+        }
 
-        SectionHeader("Software Renderer")
+        CollapsibleSection("Software Renderer") {
         HelpText(
             "Apply when the Software renderer is selected.",
             modifier = Modifier.padding(horizontal = 6.dp),
@@ -417,18 +426,10 @@ fun FixesTab(state: MutableState<Settings>) {
             description = "Software-renderer tile height per thread. Default 4. Restart the game to apply.",
             onChange = { apply(s.copy(swThreadsHeight = it)) },
         )
+        }
         Spacer(Modifier.height(8.dp))
     }
 }
 
-@Composable
-private fun SectionHeader(title: String) {
-    Spacer(Modifier.height(8.dp))
-    Text(
-        title,
-        color = Colors.pasx2_blue,
-        fontSize = 12.sp,
-        fontWeight = FontWeight.Bold,
-        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-    )
-}
+// CollapsibleSection now lives in SettingsWidgets.kt (shared by the Fixes / Pad /
+// Performance / Renderer tabs).

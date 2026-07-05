@@ -422,8 +422,15 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 	m_optional_extensions.vk_ext_memory_budget = SupportsExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_calibrated_timestamps =
 		SupportsExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME, false);
+	// ROAA is DUAL-NAMED: ARM shipped VK_ARM_rasterization_order_attachment_access (Mali
+	// driver r36p0), and the promoted VK_EXT_ alias only landed at r40p0. The structs/enums
+	// are identical (alias), so accept EITHER — otherwise Mali on r36-r39 blobs (a big chunk
+	// of mid-tier, incl. Tensor G2/G3 on old blobs) exposes only the ARM name and gets
+	// silently demoted to the per-primitive-barrier slideshow. SupportsExtension enables
+	// whichever name it finds (EXT preferred via short-circuit). Matches upstream 5da4b7e.
 	m_optional_extensions.vk_ext_rasterization_order_attachment_access =
-		SupportsExtension(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME, false);
+		SupportsExtension(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME, false) ||
+		SupportsExtension(VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_attachment_feedback_loop_layout =
 		SupportsExtension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_line_rasterization = SupportsExtension(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME, false);
@@ -473,6 +480,7 @@ bool GSDeviceVK::SelectDeviceFeatures()
 	m_device_features.textureCompressionBC = available_features.textureCompressionBC;
 	m_device_features.geometryShader = available_features.geometryShader;
 	m_device_features.fragmentStoresAndAtomics = available_features.fragmentStoresAndAtomics;
+	m_device_features.pipelineStatisticsQuery = available_features.pipelineStatisticsQuery;
 
 	return true;
 }
@@ -707,6 +715,9 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		static_cast<u32>(m_device_properties.limits.timestampComputeAndGraphics),
 		queue_family_properties[m_graphics_queue_family_index].timestampValidBits,
 		m_device_properties.limits.timestampPeriod);
+
+	m_gpu_pipeline_statistics_supported = (m_device_features.pipelineStatisticsQuery != 0);
+	DevCon.WriteLn("GPU pipeline statistics is %s", m_gpu_pipeline_statistics_supported ? "supported" : "not supported");
 
 	if (!ProcessDeviceExtensions())
 		return false;
@@ -1051,6 +1062,20 @@ bool GSDeviceVK::CreateGlobalDescriptorPool()
 		}
 	}
 
+	if (m_gpu_pipeline_statistics_supported)
+	{
+		const VkQueryPoolCreateInfo query_create_info = {
+			VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_PIPELINE_STATISTICS, NUM_COMMAND_BUFFERS,
+			VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT};
+		res = vkCreateQueryPool(m_device, &query_create_info, nullptr, &m_pipeline_statistics_query_pool);
+		if (res != VK_SUCCESS)
+		{
+			LOG_VULKAN_ERROR(res, "vkCreateQueryPool failed: ");
+			m_gpu_pipeline_statistics_supported = false;
+			return false;
+		}
+	}
+
 	return true;
 }
 
@@ -1195,6 +1220,19 @@ bool GSDeviceVK::SetGPUTimingEnabled(bool enabled)
 	return (enabled == m_gpu_timing_enabled);
 }
 
+GPUPipelineStatistics GSDeviceVK::GetAndResetAccumulatedGPUPipelineStatistics()
+{
+	GPUPipelineStatistics stats = m_accumulated_gpu_pipeline_statistics;
+	m_accumulated_gpu_pipeline_statistics = {};
+	return stats;
+}
+
+bool GSDeviceVK::SetGPUPipelineStatisticsEnabled(bool enabled)
+{
+	m_gpu_pipeline_statistics_enabled = enabled && m_gpu_pipeline_statistics_supported;
+	return true;
+}
+
 void GSDeviceVK::ScanForCommandBufferCompletion()
 {
 	for (u32 check_index = (m_current_frame + 1) % NUM_COMMAND_BUFFERS; check_index != m_current_frame;
@@ -1250,6 +1288,8 @@ void GSDeviceVK::WaitForCommandBufferCompletion(u32 index)
 
 void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 {
+	m_render_passes_since_submit = 0; // yaps2 readback kick: reset the mid-frame counter
+
 	FrameResources& resources = m_frame_resources[m_current_frame];
 
 	// End the current command buffer.
@@ -1269,6 +1309,13 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 	{
 		vkCmdWriteTimestamp(m_current_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool,
 			m_current_frame * 2 + 1);
+	}
+
+	if (resources.pipeline_statistics_query == QueryState::Querying)
+	{
+		// Didn't end query in BeginPresent() so end it here.
+		resources.pipeline_statistics_query = QueryState::Ready;
+		vkCmdEndQuery(m_current_command_buffer, m_pipeline_statistics_query_pool, m_current_frame);
 	}
 
 	res = vkEndCommandBuffer(resources.command_buffers[1]);
@@ -1484,6 +1531,33 @@ void GSDeviceVK::ActivateCommandBuffer(u32 index)
 		vkCmdResetQueryPool(resources.command_buffers[1], m_timestamp_query_pool, index * 2, 2);
 		vkCmdWriteTimestamp(
 			resources.command_buffers[1], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_timestamp_query_pool, index * 2);
+	}
+
+	if (resources.pipeline_statistics_query == QueryState::Ready)
+	{
+		// Collect the pipeline statistics from the last time this cmdbuffer was used.
+		resources.pipeline_statistics_query = QueryState::None;
+		GPUPipelineStatistics stats{};
+		VkResult ps_res =
+			vkGetQueryPoolResults(m_device, m_pipeline_statistics_query_pool, index, 1,
+				sizeof(stats), &stats, sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+		if (ps_res == VK_SUCCESS)
+		{
+			m_accumulated_gpu_pipeline_statistics.vs_invocations += stats.vs_invocations;
+			m_accumulated_gpu_pipeline_statistics.ps_invocations += stats.ps_invocations;
+		}
+		else
+		{
+			LOG_VULKAN_ERROR(ps_res, "vkGetQueryPoolResults failed: ");
+		}
+	}
+
+	if (m_gpu_pipeline_statistics_enabled)
+	{
+		pxAssert(resources.pipeline_statistics_query == QueryState::None);
+		resources.pipeline_statistics_query = QueryState::Querying;
+		vkCmdResetQueryPool(resources.command_buffers[1], m_pipeline_statistics_query_pool, index, 1);
+		vkCmdBeginQuery(resources.command_buffers[1], m_pipeline_statistics_query_pool, index, 0);
 	}
 
 	resources.fence_counter = m_next_fence_counter++;
@@ -2449,6 +2523,14 @@ GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
 		return PresentResult::FrameSkipped;
 	}
 
+	// End the pipeline statistics for this cmdbuffer before postprocessing.
+	FrameResources& resources = m_frame_resources[m_current_frame];
+	if (resources.pipeline_statistics_query == QueryState::Querying)
+	{
+		resources.pipeline_statistics_query = QueryState::Ready;
+		vkCmdEndQuery(m_current_command_buffer, m_pipeline_statistics_query_pool, m_current_frame);
+	}
+
 	VkResult res = m_resize_requested ? VK_ERROR_OUT_OF_DATE_KHR : m_swap_chain->AcquireNextImage();
 	if (res != VK_SUCCESS)
 	{
@@ -2822,7 +2904,13 @@ bool GSDeviceVK::CheckFeatures()
 	// a toggle to ship dark and be A/B-verified per device+driver. Gated on ROAA presence, so
 	// it is a no-op on any device that does not expose the extension.
 	const bool is_mali_vk = (m_device_properties.vendorID == 0x13B5u);
-	const bool vendor_allows_fbfetch = is_mali_vk || GSConfig.EnableAdrenoFramebufferFetch;
+	// Turnip/Mesa is the open Adreno driver and does NOT exhibit the proprietary
+	// blob's stale-ROAA reads (the reason Adreno fbfetch shipped opt-in), so default
+	// it ON there — the fast blend path on a tiler that drops the per-primitive
+	// barriers spiking GS on transparency-heavy scenes. Proprietary Adreno stays
+	// opt-in via EnableAdrenoFramebufferFetch; DisableFramebufferFetch still overrides.
+	const bool is_turnip = (m_device_driver_properties.driverID == VK_DRIVER_ID_MESA_TURNIP);
+	const bool vendor_allows_fbfetch = is_mali_vk || is_turnip || GSConfig.EnableAdrenoFramebufferFetch;
 	m_features.framebuffer_fetch = vendor_allows_fbfetch &&
 		m_optional_extensions.vk_ext_rasterization_order_attachment_access && !GSConfig.DisableFramebufferFetch;
 	m_features.texture_barrier = GSConfig.OverrideTextureBarriers != 0;
@@ -2855,6 +2943,21 @@ bool GSDeviceVK::CheckFeatures()
 
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
+
+	// @@MALI_TELEMETRY@@ One-line device/driver banner so Mali (and Adreno) field reports are
+	// actionable: which GPU/driver, and — critically — which accurate-blend path was resolved:
+	// in-tile framebuffer_fetch (cheap) vs the per-primitive barrier fallback (the tile-flush
+	// slideshow). ROAA=yes but fbfetch=NO on Mali means the barrier path is active. See the
+	// Mali driver-support deep dive.
+	Console.WriteLn("VK: GPU '%s' vendor=0x%04X driver='%s' (%s) | ROAA=%s fbfetch=%s texbarrier=%s pushdesc=%s",
+		m_device_properties.deviceName,
+		m_device_properties.vendorID,
+		m_device_driver_properties.driverName,
+		m_device_driver_properties.driverInfo,
+		m_optional_extensions.vk_ext_rasterization_order_attachment_access ? "yes" : "NO",
+		m_features.framebuffer_fetch ? "yes(in-tile)" : "NO(barrier-fallback)",
+		m_features.texture_barrier ? "on" : "off",
+		m_use_push_descriptors ? "on" : "off");
 
 	// whether we can do point/line expand depends on the range of the device
 	const float f_upscale = static_cast<float>(GSConfig.UpscaleMultiplier);
@@ -3024,6 +3127,17 @@ GSTexture* GSDeviceVK::CreateSurface(GSTexture::Usage usage, int width, int heig
 std::unique_ptr<GSDownloadTexture> GSDeviceVK::CreateDownloadTexture(u32 width, u32 height, GSTexture::Format format)
 {
 	return GSDownloadTextureVK::Create(width, height, format);
+}
+
+void GSDeviceVK::HintReadbackSource(GSTexture* tex)
+{
+	// yaps2 2a5c0b1b: MRU ring of 2. Per-frame readback patterns re-read the same one or
+	// two targets, and the next draw INTO one of them predicts the next readback.
+	if (m_recent_readback_sources[0] == tex || m_recent_readback_sources[1] == tex)
+		return;
+
+	m_recent_readback_sources[1] = m_recent_readback_sources[0];
+	m_recent_readback_sources[0] = tex;
 }
 
 void GSDeviceVK::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY)
@@ -4980,6 +5094,9 @@ void GSDeviceVK::DestroyResources()
 	if (m_timestamp_query_pool != VK_NULL_HANDLE)
 		vkDestroyQueryPool(m_device, m_timestamp_query_pool, nullptr);
 
+	if (m_pipeline_statistics_query_pool != VK_NULL_HANDLE)
+		vkDestroyQueryPool(m_device, m_pipeline_statistics_query_pool, nullptr);
+
 	if (m_global_descriptor_pool != VK_NULL_HANDLE)
 		vkDestroyDescriptorPool(m_device, m_global_descriptor_pool, nullptr);
 
@@ -5394,6 +5511,7 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartPresent(bool wait_for_completion,
 
 void GSDeviceVK::ExecuteCommandBufferForReadback()
 {
+	m_render_passes_since_readback = 0; // yaps2 readback kick: a readback just happened
 	ExecuteCommandBuffer(true);
 	if (m_spinning_supported && GSConfig.HWSpinGPUForReadbacks)
 	{
@@ -5700,6 +5818,11 @@ void GSDeviceVK::EndRenderPass()
 
 	m_current_render_pass = VK_NULL_HANDLE;
 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
+	// yaps2 readback kick: count render passes since the last submit / readback so
+	// RenderHW can decide when to submit mid-frame.
+	m_render_passes_since_submit++;
+	if (m_render_passes_since_readback != ~0u)
+		m_render_passes_since_readback++;
 
 	vkCmdEndRenderPass(GetCurrentCommandBuffer());
 }
@@ -6116,6 +6239,36 @@ GSTextureVK* GSDeviceVK::SetupPrimitiveTrackingDATE(GSHWDrawConfig& config)
 
 void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 {
+	// yaps2 27984e96/2a5c0b1b — mid-frame command-buffer kick for readback-prone frames.
+	// While a readback frame records, submit accumulated work at this render-pass boundary
+	// (draw entry — nothing staged yet, every binding below re-applies via dirty flags) so
+	// the GPU runs concurrently with GS-thread recording instead of only starting when the
+	// readback fence-waits on it. Gated to OUTSIDE a render pass (no forced tile flush on
+	// tilers) and to frames near an actual readback (games that never read back see zero
+	// change). Threshold is insensitive 4..16 (measured OutRun 2006/SD865, 19.6->16.2ms).
+	{
+		constexpr u32 kick_threshold = 8;
+		constexpr u32 readback_window = 128; // ~a few frames' worth of render passes
+		// A draw into a recent readback source is (almost certainly) producing the data for
+		// the next readback, which follows immediately — kick regardless of the threshold.
+		const bool produces_readback_data = config.rt &&
+			(config.rt == m_recent_readback_sources[0] || config.rt == m_recent_readback_sources[1]);
+		if ((m_render_passes_since_submit >= kick_threshold ||
+				(produces_readback_data && m_render_passes_since_submit > 0)) &&
+			m_render_passes_since_readback <= readback_window && !InRenderPass())
+		{
+			// Never block: submitting cycles to the next command buffer, and
+			// ActivateCommandBuffer fence-waits if that buffer's previous submission is still
+			// executing — a hidden GPU sync worse than the backlog the kick drains. Only kick
+			// when the next buffer is verifiably complete; otherwise keep recording and retry
+			// at the next draw (the counter keeps the gate open).
+			ScanForCommandBufferCompletion();
+			const u32 next_buffer = (m_current_frame + 1) % NUM_COMMAND_BUFFERS;
+			if (m_frame_resources[next_buffer].fence_counter <= m_completed_fence_counter)
+				ExecuteCommandBuffer(WaitType::None);
+		}
+	}
+
 	const GSVector2i rtsize(config.rt ? config.rt->GetSize() : config.ds->GetSize());
 	GSTextureVK* draw_rt = config.ps.HasColorROV() ? nullptr : static_cast<GSTextureVK*>(config.rt);
 	GSTextureVK* draw_ds = config.ps.HasDepthROV() ? nullptr : static_cast<GSTextureVK*>(config.ds);

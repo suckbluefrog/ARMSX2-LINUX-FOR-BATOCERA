@@ -46,19 +46,82 @@ fun PerformanceTab(state: MutableState<Settings>) {
         // segment auto-reflects "Custom" once the user tweaks any speedhack below.
         run {
             val safe = s.copy(eeCycleRate = 0, eeCycleSkip = 0, mtvu = true, vu1Instant = true,
-                vuFlagHack = true, intcStat = true, waitLoop = true, fastCDVD = false)
+                vuFlagHack = true, intcStat = true, waitLoop = true, fastCDVD = false,
+                // Restore the GPU-quality levers the Fast/Low-End presets lower, so
+                // Optimal is a COMPLETE reset to recommended defaults — not just the
+                // speedhacks (e.g. Texture Preloading back to Full, blending to Basic).
+                // Resolution is left as-is so upscalers aren't dropped to native.
+                accurateBlendingUnit = 1, hwMipmap = true, texturePreloading = 2, hwRov = false)
+            // Fast = speed-first: EE cycle skip + fast CDVD, plus render-side wins
+            // that are safe for most games (native resolution + Basic blending).
             val fast = s.copy(eeCycleRate = 0, eeCycleSkip = 2, mtvu = true, vu1Instant = true,
-                vuFlagHack = true, intcStat = true, waitLoop = true, fastCDVD = true)
-            // -1 = neither preset matches (custom): no segment highlighted.
-            val idx = when (s) { safe -> 0; fast -> 1; else -> -1 }
+                vuFlagHack = true, intcStat = true, waitLoop = true, fastCDVD = true,
+                upscaleFloat = 1.0f, accurateBlendingUnit = 1)
+            // Low-End = every cheap GPU/CPU lever, MTVU gated on core count. Built
+            // from the shared Settings.lowEndPreset so it matches the setup wizard.
+            val lowEnd = com.armsx2.config.Settings.lowEndPreset(
+                s.copy(eeCycleRate = 0, mtvu = true, vu1Instant = true,
+                    vuFlagHack = true, intcStat = true, waitLoop = true, fastCDVD = true),
+                mtvu = com.armsx2.DeviceTier.mtvuDefault(),
+            )
+            // -1 = no preset matches (custom): no segment highlighted.
+            val idx = when (s) { safe -> 0; fast -> 1; lowEnd -> 2; else -> -1 }
             SegmentedRow(
                 label = "Speedhack Profile",
-                options = listOf("Optimal", "Fast"),
+                options = listOf("Optimal", "Fast", "Low-End"),
                 selectedIndex = idx,
-                onChange = { when (it) { 0 -> apply(safe); 1 -> apply(fast) } },
+                onChange = { when (it) { 0 -> apply(safe); 1 -> apply(fast); 2 -> apply(lowEnd) } },
             )
         }
-        HelpText("Tap a preset. Optimal = safe for most games. Fast = aggressive (EE cycle skip + fast CDVD) for low-end devices; may glitch some. Tweaking any speedhack below un-highlights both (custom).")
+        HelpText("Tap a preset. Optimal = safe for most games. Fast = aggressive speedhacks + native resolution for low-end devices; may glitch some. Low-End = Fast plus every cheap GPU lever (native res, min blending, no mipmaps/palette-conv, partial texture preload) with MTVU auto-set from your CPU. Tweaking any setting un-highlights the presets (custom).")
+        SettingsDivider()
+        // ---- Display Resolution (HW scaler), NetherSX2-style ----------------
+        // Shrinks the game's OUTPUT surface (hardware-composer upscales to the
+        // screen) to cut GPU present cost, heat and battery. Global pref (not a
+        // Settings/EmuCore field) applied live via SurfaceCallbacks.applyHwScaler.
+        run {
+            // Observable state seeded from the raw pref so the segmented control reflects
+            // the change LIVE — a plain prefs.getInt() read isn't observed by Compose, so
+            // the highlight only moved on menu re-entry.
+            val hwScaler = remember { androidx.compose.runtime.mutableStateOf(com.armsx2.Main.prefs.getInt("ui.hwScaler", 0)) }
+            SegmentedRow(
+                label = "Display Resolution (HW scaler)",
+                options = listOf("Screen", "3x PS2", "2x PS2", "1x PS2"),
+                selectedIndex = when (hwScaler.value) { 3 -> 1; 2 -> 2; 1 -> 3; else -> 0 },
+                description = "Reduces the display resolution to significantly decrease device heat and battery drain. Screen = full quality (off). 3x PS2 = High Quality, 2x PS2 = Balanced, 1x PS2 = Battery Saver / Max Performance. Separate from the internal rendering resolution — menus stay sharp either way.",
+                onChange = {
+                    val n = when (it) { 1 -> 3; 2 -> 2; 3 -> 1; else -> 0 }
+                    hwScaler.value = n
+                    com.armsx2.Main.prefs.edit().putInt("ui.hwScaler", n).apply()
+                    (com.armsx2.Main.surface.value as? com.armsx2.SurfaceCallbacks)?.applyHwScaler()
+                },
+            )
+        }
+        // ---- Sustained Performance (#128) ---------------------------------------
+        // Asks Android to hold a steady, thermally-sustainable clock instead of
+        // boost-then-throttle. Better for long sessions on handhelds, but it CAPS the
+        // peak clock so peak-hungry games can lose fps — a user choice, default Off.
+        // Global pref, applied at launch (Main.onCreate) and live here via the window.
+        run {
+            val sustained = remember { androidx.compose.runtime.mutableStateOf(com.armsx2.Main.prefs.getBoolean("ui.sustainedPerf", false)) }
+            SegmentedRow(
+                label = "Sustained Performance",
+                options = listOf("Off", "On"),
+                selectedIndex = if (sustained.value) 1 else 0,
+                description = "Holds a steady, thermally-sustainable GPU/CPU clock for long play sessions — reduces mid-session throttling, heat and battery drain on handhelds. Trade-off: it caps the peak clock, so demanding games that rely on short bursts of max speed may run a little slower. Off = full peak clocks (default).",
+                onChange = {
+                    val on = it == 1
+                    sustained.value = on
+                    com.armsx2.Main.prefs.edit().putBoolean("ui.sustainedPerf", on).apply()
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                        runCatching {
+                            (com.armsx2.Main.surface.value?.context as? android.app.Activity)
+                                ?.window?.setSustainedPerformanceMode(on)
+                        }
+                    }
+                },
+            )
+        }
         SettingsDivider()
         CollapsibleSection("Speedhacks", initiallyExpanded = false) {
             IntSliderRow(
@@ -272,7 +335,19 @@ fun PerformanceTab(state: MutableState<Settings>) {
                     "FMV Software - switches FMVs to software rendering.\n" +
                     "EE Timing - adjusts CPU timing for sensitive games.\n" +
                     "Instant DMA - completes DMA transfers immediately.\n" +
-                    "Blit FPS - uses PCSX2's internal FPS blit workaround."
+                    "Blit FPS - uses PCSX2's internal FPS blit workaround.\n" +
+                    "FPU Multiply - fixes FPU multiply accuracy (Tales of Destiny).\n" +
+                    "OPH Flag - VU OPH flag hack (Bleach Blade Battlers, Growlanser II).\n" +
+                    "GIF FIFO - accurately emulates the GIF FIFO (fixes some hangs).\n" +
+                    "DMA Busy - handles the DMA busy flag (Mana Khemia, Metal Saga).\n" +
+                    "VIF1 Stall - emulates VIF1 FIFO stalls (SOCOM 2 HUD, Spy Hunter).\n" +
+                    "I-Bit - VU I-bit branch-delay fix (Scarface, Crash Tag Team Racing).\n" +
+                    "Full VU0 Sync - fully synchronizes VU0 with the EE.\n" +
+                    "VU Add-Sub - VU add/sub accuracy hack (Tri-Ace: Star Ocean 3, VP2, RadiataStories).\n" +
+                    "VU Overflow - clamps VU overflow (Superman Returns).\n" +
+                    "Extra XGKICK - extra VU XGKICK sync (Erementar Gerad).\n" +
+                    "Goemon TLB - preloads TLB map for Goemon.\n" +
+                    "VU Sync - runs VU behind the EE for tight sync (Gitaroo Man, Simple 2000 games)."
             )
         }
         SettingsDivider()
@@ -346,6 +421,18 @@ fun PerformanceTab(state: MutableState<Settings>) {
                     Spacer(Modifier.weight(1f))
                 }
             }
+            HelpText(
+                "MTVU - runs VU1 on its own thread (faster on multi-core); can break games needing tight EE/VU1 sync.\n" +
+                    "Instant VU1 - runs VU1 microprograms in one shot instead of time-sliced. Faster, safe for most.\n" +
+                    "VU Flag Hack - skips redundant VU status-flag updates. Safe for most games.\n" +
+                    "Fast CDVD - shortens disc read timing to speed up loads. Can break timing-sensitive games.\n" +
+                    "INTC Stat - fast-forwards INTC-status wait loops. Safe for most.\n" +
+                    "Wait Loop - detects and skips EE idle loops. Safe for most.\n" +
+                    "VU NEON Fusions - ARMSX2's VU1 JIT NEON optimizations (on by default). Turn off to test whether a per-game VU glitch traces back to them.\n" +
+                    "Skip VU Stall Sim - drops VU pipeline-stall timing for a big speed win. Breaks games needing accurate VU timing (glitched models, missing geometry, audio crackle).\n" +
+                    "Defer VU Writes - caches VU register writes in NEON registers (faster transforms). Can break games with cross-pair coherence (e.g. Silent Hill 2).\n" +
+                    "Skip Dupe Frames - skips presenting identical frames to save GPU."
+            )
         }
     }
 }

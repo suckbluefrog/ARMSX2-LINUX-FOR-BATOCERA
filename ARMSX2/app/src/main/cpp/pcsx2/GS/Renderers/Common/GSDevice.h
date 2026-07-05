@@ -30,6 +30,12 @@ static inline constexpr Filter BilnIf(bool biln)
 	return biln ? Biln : Nearest;
 }
 
+struct GPUPipelineStatistics
+{
+	u64 vs_invocations;
+	u64 ps_invocations;
+};
+
 enum class ShaderConvert
 {
 	COPY = 0,
@@ -1618,6 +1624,12 @@ public:
 	/// Returns the amount of GPU time utilized since the last time this method was called.
 	virtual float GetAndResetAccumulatedGPUTime() = 0;
 
+	/// Enables/disables GPU pipeline statistics.
+	virtual bool SetGPUPipelineStatisticsEnabled(bool enabled) = 0;
+
+	/// Get the pipeline statistics for the last frame.
+	virtual GPUPipelineStatistics GetAndResetAccumulatedGPUPipelineStatistics() = 0;
+
 	/// Returns true if not enough time has passed for present to not block.
 	bool ShouldSkipPresentingFrame();
 
@@ -1650,6 +1662,13 @@ public:
 	GSTexture* CreateCompatible(GSTexture* tex, int w, int h, bool clear = true, bool prefer_reuse = true);
 
 	virtual std::unique_ptr<GSDownloadTexture> CreateDownloadTexture(u32 width, u32 height, GSTexture::Format format) = 0;
+
+	/// Hints that a synchronous CPU readback of `tex` is being performed. Games that read
+	/// back every frame (e.g. small occlusion-test targets) will typically draw into the
+	/// same texture again shortly before the next readback; backends can use this to
+	/// schedule command submission so that readback has minimal GPU backlog to wait on.
+	/// (Ported from yaps2 27984e96/2a5c0b1b — the mid-frame readback kick.)
+	virtual void HintReadbackSource(GSTexture* tex);
 
 	virtual void CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY) = 0;
 

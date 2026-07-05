@@ -6,8 +6,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
@@ -435,7 +438,10 @@ fun CollapsibleSection(
             .fillMaxWidth()
             .controllerFocusable(controllerId = "sect:$title", onConfirm = { toggle() })
             .clickable { toggle() }
-            .padding(horizontal = 6.dp, vertical = 4.dp),
+            // Taller tap target (~48dp) so adjacent section headers aren't
+            // easy to mis-tap; the whole row toggles, so the padding IS the
+            // hit-area for the arrow too.
+            .padding(horizontal = 6.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -445,7 +451,8 @@ fun CollapsibleSection(
             fontWeight = FontWeight.Bold,
             modifier = Modifier.weight(1f),
         )
-        Text(if (expanded) "▾" else "▸", color = Colors.pasx2_blue, fontSize = 12.sp)
+        // Bigger, easier-to-hit collapse chevron (was 12sp).
+        Text(if (expanded) "▾" else "▸", color = Colors.pasx2_blue, fontSize = 18.sp)
     }
     if (expanded) content()
 }
@@ -677,14 +684,19 @@ private fun DiscreteSlider(
                     val f = ((x - edgePx) / usable).coerceIn(0f, 1f)
                     latestOnChange(min + (f * steps).roundToInt())
                 }
-                detectTapGestures { update(it.x) }
-            }
-            .pointerInput(min, max) {
-                val edgePx = 6.dp.toPx()
-                detectHorizontalDragGestures { change, _ ->
-                    val usable = (size.width - edgePx * 2).coerceAtLeast(1f)
-                    val f = ((change.position.x - edgePx) / usable).coerceIn(0f, 1f)
-                    latestOnChange(min + (f * steps).roundToInt())
+                // ONE gesture handler: set on touch-down (tap-to-position) AND follow the
+                // finger continuously (drag). The old split detectTapGestures /
+                // detectHorizontalDragGestures across two separate pointerInput blocks fought
+                // for the pointer — the tap detector consumed the down, so a drag only landed
+                // the initial jump and then stalled until you lifted and touched again.
+                // Consuming each drag change also stops the scrolling parent from stealing it.
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    update(down.position.x)
+                    drag(down.id) { change ->
+                        update(change.position.x)
+                        change.consume()
+                    }
                 }
             },
     ) {

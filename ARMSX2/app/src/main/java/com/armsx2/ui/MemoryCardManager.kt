@@ -8,6 +8,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,6 +52,7 @@ import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
 import com.armsx2.Main
 import com.armsx2.config.ConfigStore
+import com.armsx2.config.SettingsScope
 import com.armsx2.ui.settings.SettingsControllerNav
 import com.armsx2.ui.settings.controllerFocusable
 import java.io.File
@@ -104,6 +106,23 @@ object MemoryCardManager {
                 refresh(context)
             }
         }
+        // Export a memory card OUT to a user-picked location (Downloads / Drive / etc.) via
+        // SAF, so casual users can back up or migrate saves without a file manager or Shizuku.
+        var exportPending by remember { mutableStateOf<File?>(null) }
+        val exportLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+        ) { uri: Uri? ->
+            val src = exportPending
+            exportPending = null
+            if (uri != null && src != null) {
+                runCatching {
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        src.inputStream().use { it.copyTo(out) }
+                    } ?: error("could not open destination")
+                }.onSuccess { status.value = "Exported ${src.name}." }
+                    .onFailure { status.value = "Export failed: ${it.message}" }
+            }
+        }
 
         LaunchedEffect(Unit) {
             refresh(context)
@@ -139,6 +158,20 @@ object MemoryCardManager {
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                    }
+                    // Memcard changes need a game reboot to take effect — offer it
+                    // right here (left of Close) so the user doesn't hunt for Reset.
+                    if (Main.currentGame.value != null) {
+                        Button(
+                            onClick = { visible.value = false; Main.restart() },
+                            modifier = Modifier
+                                .padding(end = 8.dp)
+                                .controllerFocusable("mc:restart", onConfirm = { visible.value = false; Main.restart() }),
+                            colors = ps2ButtonColors(),
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text("Restart")
+                        }
                     }
                     Button(
                         onClick = { visible.value = false },
@@ -190,6 +223,100 @@ object MemoryCardManager {
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text("Use Default Slots")
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+                // Per-game memory cards (NetherSX2-style): when on, each game boots
+                // with its own Slot 1 card named after its serial (auto-created by
+                // the core). Games given an explicit Slot 1 card keep it.
+                var perGameCards by remember { mutableStateOf(Main.prefs.getBoolean("memcard.perGame", false)) }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Per-Game Memory Cards", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Boot each game with its own Slot 1 card (named after its serial, auto-created). Restart the game to apply.",
+                            color = Color(0xFFAAAAAA),
+                            fontSize = 10.sp,
+                        )
+                    }
+                    SelectChip(
+                        label = if (perGameCards) "On" else "Off",
+                        selected = perGameCards,
+                        id = "mc:pergame",
+                    ) {
+                        perGameCards = !perGameCards
+                        Main.prefs.edit().putBoolean("memcard.perGame", perGameCards).apply()
+                    }
+                }
+
+                // Per-game Slot 1 picker: assign a SPECIFIC card to the current
+                // game instead of the forced serial-named card. Only shown while a
+                // game is loaded (currentGame set). Writing memoryCardSlot1Filename
+                // as a per-game override is respected by Main.applyRendererPrefs,
+                // which skips the auto serial card when an explicit override exists.
+                val game = Main.currentGame.value
+                val gameSerial = game?.serial?.takeIf { it.isNotBlank() }
+                if (gameSerial != null) {
+                    // Bump on assign so the highlight re-reads resolveForGame().
+                    var pgVersion by remember { mutableStateOf(0) }
+                    // Read effective per-game + global values (pgVersion forces re-read).
+                    val effective = remember(gameSerial, pgVersion) { ConfigStore.resolveForGame(gameSerial) }
+                    val globalSlot1 = remember(pgVersion) { ConfigStore.loadGlobal().memoryCardSlot1Filename }
+                    val current = effective.memoryCardSlot1Filename
+                    val usesGlobal = current.equals(globalSlot1, ignoreCase = true)
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "Slot 1 card for \"${game.title}\"",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        "Pick a card for this game only (overrides the auto serial card). Restart the game to apply.",
+                        color = Color(0xFFAAAAAA),
+                        fontSize = 10.sp,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    val pgScroll = rememberScrollState()
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(pgScroll),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        SelectChip(
+                            label = "Global default",
+                            selected = usesGlobal,
+                            id = "mc:pg:__global__",
+                        ) {
+                            val g = ConfigStore.resolveForGame(gameSerial)
+                            ConfigStore.save(
+                                SettingsScope.Game,
+                                gameSerial,
+                                g.copy(memoryCardSlot1Filename = globalSlot1, memoryCardSlot1Enabled = true),
+                            )
+                            status.value = "\"${game.title}\" now uses the global Slot 1 card. Restart the game to apply."
+                            pgVersion++
+                        }
+                        files.filter { it.isFile }.forEach { card ->
+                            val selected = !usesGlobal && card.name.equals(current, ignoreCase = true)
+                            SelectChip(
+                                label = card.name,
+                                selected = selected,
+                                id = "mc:pg:${card.name}",
+                            ) {
+                                val g = ConfigStore.resolveForGame(gameSerial)
+                                ConfigStore.save(
+                                    SettingsScope.Game,
+                                    gameSerial,
+                                    g.copy(memoryCardSlot1Filename = card.name, memoryCardSlot1Enabled = true),
+                                )
+                                status.value = "Assigned ${card.name} to ${game.title}. Restart the game to apply."
+                                pgVersion++
+                            }
+                        }
                     }
                 }
 
@@ -369,6 +496,20 @@ object MemoryCardManager {
                                 ) {
                                     Text(if (inSlot2) "✓ Slot 2" else "Slot 2", fontSize = 11.sp)
                                 }
+                                // Export (file cards only — folder cards aren't a single file).
+                                if (!file.isDirectory) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Button(
+                                        onClick = { exportPending = file; exportLauncher.launch(file.name) },
+                                        colors = darkButtonColors(),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier
+                                            .height(32.dp)
+                                            .controllerFocusable("mc:export:${file.name}", onConfirm = { exportPending = file; exportLauncher.launch(file.name) }),
+                                    ) {
+                                        Text("Export", fontSize = 11.sp)
+                                    }
+                                }
                                 Spacer(Modifier.width(6.dp))
                                 val armed = deleteArmed == file.name
                                 Button(
@@ -397,7 +538,7 @@ object MemoryCardManager {
 
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "Import File adds a memory card (then tap Slot 1 or Slot 2 to use it). Import Folder imports .ps2/.mcr cards found in a folder, or the folder itself as a folder memory card. Delete removes a card and clears its slot.",
+                    "Import File adds a memory card (then tap Slot 1 or Slot 2 to use it). Import Folder imports .ps2/.mcr cards found in a folder, or the folder itself as a folder memory card. Export saves a card out to Downloads / Drive / anywhere for backup or moving to another device. Delete removes a card and clears its slot.",
                     color = Color(0xFF888888),
                     fontSize = 11.sp,
                 )
@@ -413,7 +554,37 @@ object MemoryCardManager {
             ?.filter { it.isFile || it.isDirectory }
             ?.sortedWith(compareBy<File> { !it.name.endsWith(".ps2", ignoreCase = true) }.thenBy { it.name.lowercase() })
             ?.let { files.addAll(it) }
+        reconcileOrphanedSlots()
         readSlotState()
+    }
+
+    /** Self-heal slot assignments after an OUT-OF-BAND card deletion — i.e. deleting the .ps2 with
+     *  a file manager instead of the in-app Delete button (which already runs clearSlot +
+     *  restoreDefaultSlot). If an enabled slot still names a card that is no longer on disk, run
+     *  that same cleanup here. Otherwise the stale SlotN_Filename lingers, the BIOS recreates the
+     *  deleted card empty at boot, and the active-slot marker (which matches by filename) lands on
+     *  the wrong card — the "the next card got renamed to the deleted one" report (issue #-memcard).
+     *  This makes the external-delete path converge to the same clean state as the in-app Delete. */
+    private fun reconcileOrphanedSlots() {
+        if (!Main.nativeReady.value) return
+        val onDisk = files.map { it.name.lowercase() }.toSet()
+        val g = ConfigStore.loadGlobal()
+        // Only reconcile a genuinely-orphaned CUSTOM card. A missing DEFAULT card (Mcd00N.ps2) needs
+        // no cleanup: the core recreates it at boot and the slot already names it, so the active-slot
+        // marker still matches — there is no wrong-card problem to fix. Skipping defaults also avoids
+        // redundant config writes before the first boot, when Mcd00N.ps2 don't exist on disk yet.
+        fun isDefault(slot: Int, name: String) =
+            name.equals(if (slot == 2) "Mcd002.ps2" else "Mcd001.ps2", ignoreCase = true)
+        if (g.memoryCardSlot1Enabled && g.memoryCardSlot1Filename.isNotEmpty() &&
+            !isDefault(1, g.memoryCardSlot1Filename) &&
+            g.memoryCardSlot1Filename.lowercase() !in onDisk) {
+            clearSlot(1); restoreDefaultSlot(1)
+        }
+        if (g.memoryCardSlot2Enabled && g.memoryCardSlot2Filename.isNotEmpty() &&
+            !isDefault(2, g.memoryCardSlot2Filename) &&
+            g.memoryCardSlot2Filename.lowercase() !in onDisk) {
+            clearSlot(2); restoreDefaultSlot(2)
+        }
     }
 
     /** Refresh the cached per-slot bindings shown as the "active" markers. */

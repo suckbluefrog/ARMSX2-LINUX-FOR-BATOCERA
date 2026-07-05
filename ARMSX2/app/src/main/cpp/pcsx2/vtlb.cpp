@@ -23,6 +23,7 @@
 #include "IopMem.h"
 #include "Host.h"
 #include "VMManager.h"
+#include "EEDiffVerify.h" // @@EEDIFF@@ store-capture mode for the diff verifier
 
 #include "common/BitUtils.h"
 #include "common/Error.h"
@@ -248,6 +249,15 @@ void vtlb_memWrite(u32 addr, DataType data)
 {
 	static const uint DataSize = sizeof(DataType) * 8;
 
+	// @@EEDIFF@@ Differential-verify store capture: record {addr,size,value} and return
+	// WITHOUT touching real memory (the recompiler already wrote the authoritative bytes;
+	// letting the interpreter re-run store here would double-write / corrupt them).
+	if (g_ee_diff_capture_stores) [[unlikely]]
+	{
+		eeDiffCaptureStore(addr, DataSize, static_cast<u64>(data), 0);
+		return;
+	}
+
 	auto vmv = vtlbdata.vmap[addr >> VTLB_PAGE_BITS];
 
 	if (!vmv.isHandler(addr))
@@ -287,6 +297,14 @@ void vtlb_memWrite(u32 addr, DataType data)
 
 void TAKES_R128 vtlb_memWrite128(u32 mem, r128 value)
 {
+	// @@EEDIFF@@ Differential-verify store capture (128-bit) — see vtlb_memWrite above.
+	if (g_ee_diff_capture_stores) [[unlikely]]
+	{
+		alignas(16) u128 r = r128_to_u128(value);
+		eeDiffCaptureStore(mem, 128, r.lo, r.hi);
+		return;
+	}
+
 	auto vmv = vtlbdata.vmap[mem >> VTLB_PAGE_BITS];
 
 	if (!vmv.isHandler(mem))
@@ -1049,12 +1067,17 @@ bool vtlb_ResolveFastmemMapping(uptr* addr)
 
 bool vtlb_GetGuestAddress(uptr host_addr, u32* guest_addr)
 {
-	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
-	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
-	if (host_addr < fastmem_start || host_addr > fastmem_end)
+	// yaps2 2801ebde: subtraction-first, single unsigned bound. `fastmem_start +
+	// 0xFFFFFFFF` overflows a 64-bit uptr when the fastmem mapping lands within 4 GB of the
+	// top of the address space (exotic kernels / high-mmap allocators), wrapping fastmem_end
+	// below fastmem_start so the two-sided compare silently rejected every valid in-range
+	// address. `offset >= FASTMEM_AREA_SIZE` is overflow-proof regardless of base.
+	const uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
+	const uptr offset = host_addr - fastmem_start;
+	if (offset >= FASTMEM_AREA_SIZE)
 		return false;
 
-	*guest_addr = static_cast<u32>(host_addr - fastmem_start);
+	*guest_addr = static_cast<u32>(offset);
 	return true;
 }
 

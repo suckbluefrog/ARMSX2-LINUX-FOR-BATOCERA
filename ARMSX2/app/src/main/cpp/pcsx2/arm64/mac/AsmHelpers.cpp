@@ -9,6 +9,8 @@
 #include "common/Console.h"
 #include "common/HostSys.h"
 
+#include <new> // placement new for s_armAsmStorage
+
 
 namespace pcsx2_macrec {
 
@@ -100,6 +102,14 @@ void armAlignAsmPtr()
 	armAsmPtr = new_ptr;
 }
 
+// Placement-new the per-block MacroAssembler into a thread_local buffer instead of a heap
+// new/delete on every JIT block compile: one fewer alloc/free pair per block, and it
+// sidesteps the Android scudo tag/header corruption class this exact new/delete-per-block
+// pattern is prone to (yaps2 810020d8, crediting ARMSX2 1c1d0b880). Safe because armAsm is
+// itself thread_local and the pxAssert(!armAsm) invariant keeps one live per thread (MTVU
+// compiles VU1 on its own thread, with its own buffer).
+alignas(vixl::aarch64::MacroAssembler) static thread_local u8 s_armAsmStorage[sizeof(vixl::aarch64::MacroAssembler)];
+
 u8* armStartBlock()
 {
 	armAlignAsmPtr();
@@ -107,7 +117,7 @@ u8* armStartBlock()
 	HostSys::BeginCodeWrite();
 
 	pxAssert(!armAsm);
-	armAsm = new vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armAsmPtr), armAsmCapacity);
+	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armAsmPtr), armAsmCapacity);
 	armAsm->GetScratchVRegisterList()->Remove(31);
 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
 	return armAsmPtr;
@@ -122,7 +132,7 @@ u8* armEndBlock()
 	const u32 size = static_cast<u32>(armAsm->GetSizeOfCodeGenerated());
 	pxAssert(size < armAsmCapacity);
 
-	delete armAsm;
+	armAsm->~MacroAssembler(); // placement-new'd into s_armAsmStorage; no delete
 	armAsm = nullptr;
 
 	HostSys::EndCodeWrite();
@@ -199,6 +209,22 @@ void armEmitCall(const void* ptr, bool force_inline)
 		a64::SingleEmissionCheckScope guard(armAsm);
 		armAsm->bl(displacement);
 	}
+}
+
+void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)
+{
+	const s64 displacement = GetPCDisplacement(code_address, target);
+	pxAssert(vixl::IsInt26(displacement));
+
+	// ARM64 B (unconditional branch): 0b000101 | imm26
+	u32 insn = 0x14000000u | (static_cast<u32>(displacement) & 0x03FFFFFFu);
+
+	HostSys::BeginCodeWrite();
+	std::memcpy(code_address, &insn, sizeof(insn));
+	HostSys::EndCodeWrite();
+
+	if (flush_icache)
+		HostSys::FlushInstructionCache(code_address, 4);
 }
 
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr)

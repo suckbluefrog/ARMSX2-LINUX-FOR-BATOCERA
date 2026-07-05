@@ -235,7 +235,13 @@ private fun parseSnapshot(json: String): AchievementSnapshot {
             items = items,
             active = root.optBoolean("active", false),
             loggedIn = root.optBoolean("loggedIn", false),
-            hardcore = root.optBoolean("hardcore", false),
+            // With NO game running the live rcheevos flag is always off, which made the
+            // global (home-screen) Hardcore toggle read + show as off even when the user
+            // had it enabled. Fall back to the PERSISTED Achievements/ChallengeMode setting
+            // (what engages on the next boot) so the global toggle reflects reality.
+            hardcore = if (com.armsx2.Main.eState.value == com.armsx2.EmuState.STOPPED)
+                runCatching { NativeApp.isHardcorePersisted() }.getOrDefault(false)
+            else root.optBoolean("hardcore", false),
             userName = root.optString("userName", ""),
             score = root.optLong("score", -1),
             softcoreScore = root.optLong("softcoreScore", -1),
@@ -471,14 +477,14 @@ private fun AchievementsAccountRow(
                 if (snapshot.score >= 0) append("${formatPoints(snapshot.score)} pts")
                 if (snapshot.softcoreScore > 0) {
                     if (isNotEmpty()) append(" · ")
-                    append("${formatPoints(snapshot.softcoreScore)} SC")
+                    append("${formatPoints(snapshot.softcoreScore)} casual")
                 }
             }
             if (pts.isNotEmpty()) {
                 Text(pts, color = Color(0xFFFFCC66), fontSize = 11.sp)
             }
         }
-        // Hardcore toggle (red HARDCORE when on, grey SOFTCORE when off). Tap/A
+        // Hardcore toggle (red HARDCORE when on, grey CASUAL when off). Tap/A
         // routes to the host overlay's confirm → reset, so enabling is deliberate.
         if (onHardcoreToggle != null) {
             val active = snapshot.hardcore
@@ -496,7 +502,7 @@ private fun AchievementsAccountRow(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = if (active) "HARDCORE" else "SOFTCORE",
+                    text = if (active) "HARDCORE" else "CASUAL",
                     color = fg,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,

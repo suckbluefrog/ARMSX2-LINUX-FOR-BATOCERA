@@ -189,7 +189,12 @@ object SetupImpl {
     private val recAntiBlur = mutableStateOf(true)
     private val recWidescreen = mutableStateOf(false)
     private val recDeinterlaceOff = mutableStateOf(false) // false = Automatic, true = Off
-    private val recPerfFast = mutableStateOf(false)  // false = Optimal (safe), true = Fast
+    // Recommended performance preset: 0 = Optimal (safe), 1 = Fast (aggressive
+    // speedhacks + native res), 2 = Low-End (Fast plus every cheap GPU lever — min
+    // blending, no mipmaps/palette-conv, partial texture preload, ROV off). Detected
+    // low-end devices pre-select Low-End so budget users actually get those defaults
+    // instead of leaving 2x on the table in settings they never find (#124).
+    private val recPerfPreset = mutableStateOf(0)
 
     // -------- Custom Vulkan driver state --------
     /** Active driver id (matches `CustomDriver.InstalledDriver.id`). null
@@ -258,6 +263,7 @@ object SetupImpl {
         // post-init via Main.kickoffEmucoreInit's pushBiosFilenamePin().
         if (outFile.absolutePath == Main.bios.value && outFile.exists() && outFile.length() > 0L) {
             configuredBiosInfo.value = bios.info
+            copyBiosSiblings(context, bios, biosDir)
             pinBiosIfReady(outFile)
             return outFile.absolutePath
         }
@@ -265,6 +271,7 @@ object SetupImpl {
         return try {
             if (!copyBiosSafely(context, bios, outFile))
                 return null
+            copyBiosSiblings(context, bios, biosDir)
 
             Main.bios.value = outFile.absolutePath
             Main.prefs.edit().putString("bios", outFile.absolutePath).apply()
@@ -311,6 +318,54 @@ object SetupImpl {
         }.getOrDefault(false)
         tmp.delete()
         return installed && outFile.exists() && outFile.length() > 0L
+    }
+
+    // Copy the BIOS's sibling ROM1/ROM2/EROM extension images from the picked
+    // source folder into the app-private BIOS dir, alongside the main BIOS. The
+    // Chinese BIOS needs its 2MB ROM2 to boot; the emulator's LoadExtraRom looks
+    // for "<mainbios>.rom2" / "<base>.rom2" next to the BIOS, but setup previously
+    // copied only the main file, so Chinese BIOS/games never booted (Rudrox #). The
+    // sibling images have no ROMVER header so they're skipped by the BIOS scanner —
+    // we match them here purely by filename against the selected BIOS.
+    private fun copyBiosSiblings(context: Context, bios: ScannedBios, biosDir: File) {
+        val treeUri = biosDirUri.value ?: lastScannedDir.value ?: return
+        val displayName = bios.displayName
+        val base = displayName.substringBeforeLast('.', displayName)
+        val romExts = setOf("rom1", "rom2", "erom")
+        val tree = runCatching { DocumentFile.fromTreeUri(context, treeUri) }.getOrNull() ?: return
+        for (f in tree.listFiles()) {
+            if (!f.isFile) continue
+            val name = f.name ?: continue
+            val ext = name.substringAfterLast('.', "").lowercase()
+            if (ext !in romExts) continue
+            val stem = name.substringBeforeLast('.')
+            // Land it under the exact name LoadExtraRom builds (append form for a
+            // "<mainbios>.rom2" sibling, replace-ext form for a "<base>.rom2" one),
+            // with a lowercased extension so the case-sensitive fs lookup matches.
+            val target = when {
+                stem.equals(displayName, ignoreCase = true) -> "$displayName.$ext"
+                stem.equals(base, ignoreCase = true) -> "$base.$ext"
+                else -> continue
+            }
+            val outFile = File(biosDir, target)
+            if (outFile.exists() && outFile.length() > 0L) continue
+            runCatching {
+                val tmp = File(biosDir, ".$target.import.tmp")
+                if (tmp.exists()) tmp.delete()
+                val copied = context.contentResolver.openInputStream(f.uri)?.use { ins ->
+                    tmp.outputStream().use { outs -> ins.copyTo(outs) }
+                } ?: 0L
+                if (copied > 0L && tmp.length() > 0L) {
+                    outFile.delete()
+                    if (!tmp.renameTo(outFile)) {
+                        tmp.copyTo(outFile, overwrite = true)
+                        tmp.delete()
+                    }
+                } else {
+                    tmp.delete()
+                }
+            }
+        }
     }
 
     private fun selectedBiosSourceFile(bios: ScannedBios): File? {
@@ -625,27 +680,59 @@ object SetupImpl {
         recAntiBlur.value = g.antiBlur
         recWidescreen.value = g.enableWideScreenPatches
         recDeinterlaceOff.value = g.deinterlaceMode == 1 // 0 = Auto, 1 = Off
-        recPerfFast.value = g.eeCycleSkip >= 2 || g.fastCDVD
+        // Default the Performance choice from any prior config, but on a fresh
+        // low-end device pre-RECOMMEND the full Low-End preset (never forced — the
+        // user can flip it on the same screen). The probe is best-effort; a bad read
+        // reports "not low-end" and falls back to detecting Fast vs Optimal from the
+        // prior config.
+        val ctx = Main.instance
+        val lowEnd = ctx != null && runCatching { com.armsx2.DeviceTier.isLowEnd(ctx) }.getOrDefault(false)
+        recPerfPreset.value = when {
+            lowEnd -> 2
+            g.eeCycleSkip >= 2 || g.fastCDVD -> 1
+            else -> 0
+        }
     }
 
     /** Write the Recommended Settings choices to the GLOBAL config tier. */
     private fun finishRecommendedStep() {
         runCatching {
             val g = com.armsx2.config.ConfigStore.loadGlobal()
-            com.armsx2.config.ConfigStore.saveGlobal(
-                g.copy(
-                    aspectRatio = recAspect.value.coerceIn(0, 4),
-                    upscaleFloat = recUpscale.value.coerceIn(1, 8).toFloat(),
-                    antiBlur = recAntiBlur.value,
-                    enableWideScreenPatches = recWidescreen.value,
-                    deinterlaceMode = if (recDeinterlaceOff.value) 1 else 0,
-                    // Performance preset: Optimal (safe) vs Fast (aggressive) — mirrors
-                    // the in-game PerformanceTab Optimal/Fast snapshots.
-                    eeCycleRate = 0,
-                    eeCycleSkip = if (recPerfFast.value) 2 else 0,
-                    fastCDVD = recPerfFast.value,
-                )
+            // First-run only: seed MTVU from the CPU rather than the persisted
+            // Settings default (which we can't change without bleeding into
+            // existing users' saved configs). Multi-threaded VU1 is a net win
+            // only when there are spare cores (>= 6); on budget SoCs it costs
+            // more than it saves.
+            val mtvuDefault = com.armsx2.DeviceTier.mtvuDefault()
+            val base = g.copy(
+                aspectRatio = recAspect.value.coerceIn(0, 4),
+                upscaleFloat = recUpscale.value.coerceIn(1, 8).toFloat(),
+                antiBlur = recAntiBlur.value,
+                enableWideScreenPatches = recWidescreen.value,
+                deinterlaceMode = if (recDeinterlaceOff.value) 1 else 0,
+                mtvu = mtvuDefault,
             )
+            // Performance preset (mirrors the in-game PerformanceTab presets so the
+            // wizard and settings agree):
+            //   0 Optimal  — safe defaults.
+            //   1 Fast     — EE cycle skip + fast CDVD + native res + Basic blending.
+            //   2 Low-End  — the shared Settings.lowEndPreset: Fast plus every cheap
+            //                GPU lever (Minimum blending, no mipmaps/palette-conv,
+            //                Partial texture preload, ROV off, eeCycleSkip 1), MTVU
+            //                already seeded device-aware in [base]. #124: this is what
+            //                a detected low-end device now gets by default.
+            val resolved = when (recPerfPreset.value) {
+                2 -> com.armsx2.config.Settings.lowEndPreset(base.copy(eeCycleRate = 0, fastCDVD = true), mtvuDefault)
+                1 -> base.copy(
+                    eeCycleRate = 0,
+                    eeCycleSkip = 2,
+                    fastCDVD = true,
+                    upscaleFloat = 1.0f,
+                    accurateBlendingUnit = 1,
+                )
+                else -> base.copy(eeCycleRate = 0, eeCycleSkip = 0, fastCDVD = false)
+            }
+            com.armsx2.config.ConfigStore.saveGlobal(resolved)
         }
     }
 
@@ -1965,7 +2052,7 @@ object SetupImpl {
             RecChoiceRow("Anti-Blur", listOf("Off", "On"), if (recAntiBlur.value) 1 else 0, blue) { recAntiBlur.value = it == 1 }
             RecChoiceRow("Widescreen Patches", listOf("Off", "On"), if (recWidescreen.value) 1 else 0, blue) { recWidescreen.value = it == 1 }
             RecChoiceRow("Deinterlacing", listOf("Auto", "Off"), if (recDeinterlaceOff.value) 1 else 0, blue) { recDeinterlaceOff.value = it == 1 }
-            RecChoiceRow("Performance", listOf("Optimal", "Fast"), if (recPerfFast.value) 1 else 0, blue) { recPerfFast.value = it == 1 }
+            RecChoiceRow("Performance", listOf("Optimal", "Fast", "Low-End"), recPerfPreset.value.coerceIn(0, 2), blue) { recPerfPreset.value = it }
             Spacer(Modifier.height(20.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(

@@ -63,6 +63,10 @@
 #include "common/Threading.h"
 #include "common/Timer.h"
 
+#ifdef _M_X86
+#include "common/emitter/x86emitter.h"
+#endif
+
 #include "IconsFontAwesome.h"
 #include "IconsPromptFont.h"
 #include "cpuinfo.h"
@@ -2768,8 +2772,12 @@ void VMManager::UpdateCPUImplementations()
 		CpuVU0 = &CpuIntVU0;
 #ifdef INTERP_VU1
 		CpuVU1 = &CpuIntVU1;
-#else
+#elif defined(_M_X86)
+		CpuVU1 = &CpuMicroVU1;
+#elif defined(__aarch64__) || defined(_M_ARM64)
 		CpuVU1 = &CpuArmVU1;
+#else
+		CpuVU1 = &CpuIntVU1;
 #endif
 		return;
 	}

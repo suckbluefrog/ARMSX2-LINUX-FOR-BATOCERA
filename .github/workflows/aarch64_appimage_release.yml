@@ -1,0 +1,266 @@
+name: aarch64 AppImage Releases
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: "Repository to build"
+        required: true
+        default: "ARMSX2/ARMSX2"
+      source_ref:
+        description: "Tag, branch, or commit to build"
+        required: true
+        default: "MacOSv2.6.0"
+      release_tag:
+        description: "Release tag in this repository; defaults to source_ref"
+        required: false
+      publish_release:
+        description: "Upload the AppImage to a GitHub release"
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: write
+
+env:
+  DEFAULT_SOURCE_REPOSITORY: ARMSX2/ARMSX2
+  DEFAULT_TAG_PATTERN: "MacOSv*"
+  PATCHES_URL: https://github.com/isztldav/pcsx2_patches/releases/download/latest
+
+jobs:
+  resolve:
+    name: Resolve source ref
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.resolve.outputs.skip }}
+      source_repository: ${{ steps.resolve.outputs.source_repository }}
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      publish_release: ${{ steps.resolve.outputs.publish_release }}
+    steps:
+      - name: Resolve source ref
+        id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          skip=false
+          publish_release=true
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            source_repository="$TARGET_REPOSITORY"
+            source_ref="$REF_NAME"
+            release_tag="$REF_NAME"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            source_repository="${INPUT_SOURCE_REPOSITORY:-$DEFAULT_SOURCE_REPOSITORY}"
+            source_ref="${INPUT_SOURCE_REF:-}"
+            release_tag="${INPUT_RELEASE_TAG:-$source_ref}"
+            publish_release="${INPUT_PUBLISH_RELEASE:-true}"
+
+            if [[ -z "$source_ref" ]]; then
+              echo "::error::source_ref is required for manual builds."
+              exit 1
+            fi
+          else
+            source_repository="$DEFAULT_SOURCE_REPOSITORY"
+            source_ref=""
+            release_tag=""
+            pattern="$DEFAULT_TAG_PATTERN"
+
+            while IFS= read -r tag; do
+              [[ "$tag" == $pattern ]] || continue
+
+              if gh api "repos/$TARGET_REPOSITORY/releases/tags/$tag" >/dev/null 2>&1; then
+                echo "Release already exists for $tag."
+                continue
+              fi
+
+              source_ref="$tag"
+              release_tag="$tag"
+              break
+            done < <(gh api --paginate "repos/$source_repository/tags?per_page=100" --jq ".[].name")
+
+            if [[ -z "$source_ref" ]]; then
+              echo "No unreleased tags matching $pattern were found."
+              skip=true
+              publish_release=false
+            fi
+          fi
+
+          {
+            echo "skip=$skip"
+            echo "source_repository=$source_repository"
+            echo "source_ref=$source_ref"
+            echo "release_tag=$release_tag"
+            echo "publish_release=$publish_release"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build aarch64 AppImage
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-24.04-arm
+    env:
+      SOURCE_REPOSITORY: ${{ needs.resolve.outputs.source_repository }}
+      SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      SOURCE_DIR: ${{ github.workspace }}/source
+      PACKAGING_DIR: ${{ github.workspace }}/packaging
+    steps:
+      - name: Checkout packaging repo
+        uses: actions/checkout@v6
+        with:
+          path: packaging
+          fetch-depth: 0
+
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.resolve.outputs.source_repository }}
+          ref: ${{ needs.resolve.outputs.source_ref }}
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Overlay Linux AppImage scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$SOURCE_DIR/.github/workflows/scripts" "$SOURCE_DIR/tools"
+          cp -a "$PACKAGING_DIR/.github/workflows/scripts/linux" "$SOURCE_DIR/.github/workflows/scripts/"
+          cp -a "$PACKAGING_DIR/.github/workflows/scripts/common" "$SOURCE_DIR/.github/workflows/scripts/"
+          install -m 755 "$PACKAGING_DIR/tools/build-linux-arm64-release.sh" "$SOURCE_DIR/tools/build-linux-arm64-release.sh"
+
+      - name: Install packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get -y install \
+            aria2 build-essential ccache clang cmake curl extra-cmake-modules file git libasound2-dev libaio-dev \
+            libcurl4-openssl-dev libdbus-1-dev libdecor-0-dev libegl-dev libevdev-dev libfontconfig-dev libfreetype-dev \
+            libgtk-3-dev libgudev-1.0-dev libharfbuzz-dev libinput-dev libopengl-dev libopus-dev libpcap-dev \
+            libpipewire-0.3-dev libpulse-dev libssl-dev libudev-dev libva-dev libvpl-dev libvpl2 libwayland-dev \
+            libx11-dev libx11-xcb-dev libx264-dev libxcb1-dev libxcb-composite0-dev libxcb-cursor-dev \
+            libxcb-damage0-dev libxcb-glx0-dev libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev \
+            libxcb-present-dev libxcb-randr0-dev libxcb-render0-dev libxcb-render-util0-dev libxcb-shape0-dev \
+            libxcb-shm0-dev libxcb-sync-dev libxcb-util-dev libxcb-xfixes0-dev libxcb-xinput-dev libxcb-xkb-dev \
+            libxext-dev libxkbcommon-x11-dev libxrandr-dev lld nasm ninja-build patchelf pkg-config zlib1g-dev
+
+          sudo apt-get -y install libfuse2t64 || sudo apt-get -y install libfuse2
+
+      - name: Cache bundled dependencies
+        uses: actions/cache@v5
+        with:
+          path: source/deps
+          key: ${{ runner.os }}-aarch64-deps-${{ hashFiles('packaging/tools/build-linux-arm64-release.sh', 'packaging/.github/workflows/scripts/linux/build-dependencies-qt.sh', 'packaging/.github/workflows/scripts/common/*.patch') }}
+          restore-keys: |
+            ${{ runner.os }}-aarch64-deps-
+
+      - name: Download patch database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$SOURCE_DIR/bin/resources"
+          cd "$SOURCE_DIR/bin/resources"
+          aria2c -Z "$PATCHES_URL/patches.zip" || curl -L -o patches.zip "$PATCHES_URL/patches.zip"
+
+      - name: Prepare AppImage name
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          safe_tag="$(printf '%s' "$RELEASE_TAG" | tr '/:@ ' '----' | tr -cd 'A-Za-z0-9._+-')"
+          appimage_name="ARMSX2-${safe_tag}-anylinux-aarch64"
+
+          {
+            echo "appimage_name=$appimage_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build AppImage
+        shell: bash
+        env:
+          APPIMAGE_NAME: ${{ steps.names.outputs.appimage_name }}
+          DEPSDIR: ${{ github.workspace }}/source/deps
+          BUILDDIR: ${{ github.workspace }}/source/build
+          BUILD_DEPS: auto
+        run: |
+          set -euo pipefail
+
+          cd "$SOURCE_DIR"
+          tools/build-linux-arm64-release.sh
+
+          mkdir -p "$GITHUB_WORKSPACE/ci-artifacts"
+          mv "$SOURCE_DIR/${APPIMAGE_NAME}.AppImage" "$GITHUB_WORKSPACE/ci-artifacts/"
+
+      - name: Mirror release tag when needed
+        if: needs.resolve.outputs.publish_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --tags "https://github.com/$TARGET_REPOSITORY.git" "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release tag $RELEASE_TAG already exists in $TARGET_REPOSITORY."
+            exit 0
+          fi
+
+          git -C "$SOURCE_DIR" config user.name "github-actions[bot]"
+          git -C "$SOURCE_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$SOURCE_DIR" tag -f "$RELEASE_TAG" HEAD
+          git -C "$SOURCE_DIR" -c credential.helper= push \
+            "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPOSITORY}.git" \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.names.outputs.appimage_name }}
+          path: ci-artifacts/*.AppImage
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs:
+      - resolve
+      - build
+    if: needs.resolve.outputs.skip != 'true' && needs.resolve.outputs.publish_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: ci-artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          name: ARMSX2 ${{ needs.resolve.outputs.release_tag }}
+          body: |
+            Source: `${{ needs.resolve.outputs.source_repository }}@${{ needs.resolve.outputs.source_ref }}`
+          files: ci-artifacts/*.AppImage
+          fail_on_unmatched_files: true
+          generate_release_notes: true

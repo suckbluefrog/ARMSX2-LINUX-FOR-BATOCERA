@@ -57,6 +57,7 @@ if [[ "$need_deps" -eq 1 ]]; then
 	echo ""
 	echo ">>> Building dependencies into $DEPSDIR (this takes a long time)..."
 	export PKG_CONFIG_PATH="$DEPSDIR/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+	BUILD_FFMPEG="${BUILD_FFMPEG:-1}" \
 	BUILD_QTAPNG="${BUILD_QTAPNG:-0}" \
 		"$ROOTDIR/.github/workflows/scripts/linux/build-dependencies-qt.sh" "$DEPSDIR"
 else
@@ -75,6 +76,7 @@ cmake -B "$BUILDDIR" -G Ninja \
 	-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
 	-DENABLE_TESTS=OFF \
 	-DLTO_PCSX2_CORE=ON \
+	-DUSE_LINKED_FFMPEG=ON \
 	"$ROOTDIR"
 
 echo ""

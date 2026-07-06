@@ -1,12 +1,6 @@
 name: Android Nightly Debug Build
 
 on:
-  push:
-    branches:
-      - master
-    paths-ignore:
-      - '**/*.md'
-
   workflow_dispatch:
 
 jobs:

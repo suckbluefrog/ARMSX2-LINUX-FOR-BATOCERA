@@ -1,5 +1,5 @@
-# Whenever a commit is pushed to master (ideally via a pull-request!)
-# this action will create the next release, which means:
+# This inherited upstream workflow is kept manual-only in this fork.
+# When run in the upstream repository, it creates the next release, which means:
 # 1. tag master with the proper version
 # 2. create a new draft release (pre-released if a nightly build)
 # 3. add release notes
@@ -7,9 +7,6 @@
 name: 🏭 Create Release
 
 on:
-  push:
-    branches:
-      - master
   workflow_dispatch:
     inputs:
       is_prerelease:

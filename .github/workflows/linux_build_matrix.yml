@@ -1,12 +1,7 @@
 name: 🐧 Linux Builds
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
 
 jobs:
   build_linux_qt:

@@ -136,12 +136,12 @@ if [ "$BUILD_FFMPEG" -ne 0 ]; then
 	tar xf "ffmpeg-$FFMPEG.tar.xz"
 	cd "ffmpeg-$FFMPEG"
 
-	ffmpeg_hw_flags=(--enable-vulkan --enable-vaapi)
-	ffmpeg_encoders="ffv1,qtrle,libx264*,aac,flac,libopus,pcm_s16be,pcm_s16le,*_vulkan,*_vaapi"
+	ffmpeg_hw_flags=()
+	ffmpeg_encoders="ffv1,qtrle,libx264*,aac,flac,libopus,pcm_s16be,pcm_s16le"
 	case "$(uname -m)" in
 		x86_64|amd64)
-			ffmpeg_hw_flags+=(--enable-ffnvcodec --enable-nvenc --enable-libvpl)
-			ffmpeg_encoders="$ffmpeg_encoders,*_qsv,*_nvenc"
+			ffmpeg_hw_flags+=(--enable-vulkan --enable-vaapi --enable-ffnvcodec --enable-nvenc --enable-libvpl)
+			ffmpeg_encoders="$ffmpeg_encoders,*_vulkan,*_vaapi,*_qsv,*_nvenc"
 			;;
 	esac
 

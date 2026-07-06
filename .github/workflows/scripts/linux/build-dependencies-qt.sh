@@ -135,12 +135,22 @@ if [ "$BUILD_FFMPEG" -ne 0 ]; then
 	rm -fr "ffmpeg-$FFMPEG"
 	tar xf "ffmpeg-$FFMPEG.tar.xz"
 	cd "ffmpeg-$FFMPEG"
+
+	ffmpeg_hw_flags=(--enable-vulkan --enable-vaapi)
+	ffmpeg_encoders="ffv1,qtrle,libx264*,aac,flac,libopus,pcm_s16be,pcm_s16le,*_vulkan,*_vaapi"
+	case "$(uname -m)" in
+		x86_64|amd64)
+			ffmpeg_hw_flags+=(--enable-ffnvcodec --enable-nvenc --enable-libvpl)
+			ffmpeg_encoders="$ffmpeg_encoders,*_qsv,*_nvenc"
+			;;
+	esac
+
 	CFLAGS="-Os $CFLAGS" CXXFLAGS="-Os $CXXFLAGS" \
 		./configure --prefix="$INSTALLDIR" \
 		--disable-all --disable-autodetect --disable-static --enable-shared \
 		--enable-avcodec --enable-avformat --enable-avutil --enable-swresample --enable-swscale \
-		--enable-gpl --enable-libx264 --enable-libopus --enable-vulkan --enable-ffnvcodec --enable-nvenc --enable-vaapi --enable-libvpl \
-		--enable-encoder=ffv1,qtrle,libx264*,aac,flac,libopus,pcm_s16be,pcm_s16le,*_vulkan,*_qsv,*_nvenc,*_vaapi \
+		--enable-gpl --enable-libx264 --enable-libopus "${ffmpeg_hw_flags[@]}" \
+		--enable-encoder="$ffmpeg_encoders" \
 		--enable-muxer=avi,matroska,mov,mp3,mp4,wav \
 		--enable-protocol=file
 	make "-j$NPROCS"
